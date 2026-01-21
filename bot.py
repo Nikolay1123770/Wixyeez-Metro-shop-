@@ -1982,7 +1982,6 @@ def build_bot_app():
     app.add_handler(CallbackQueryHandler(cart_update_callback, pattern=r"^noop$"))
 
     # Покрывает текстовые кнопки меню / сообщения и фото оплаты
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
     return app

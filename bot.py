@@ -47,6 +47,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Helper Functions (MUST BE BEFORE Database class!) ---
+def now_iso() -> str:
+    """Return current UTC time in ISO format"""
+    return datetime.utcnow().isoformat()
+
+def generate_order_number() -> str:
+    """Generate unique order number"""
+    import random
+    return f"MS{datetime.now().strftime('%y%m%d')}{random.randint(1000, 9999)}"
+
+def is_admin(tg_id: int) -> bool:
+    """Check if user is admin"""
+    return tg_id in ADMIN_IDS
+
+def validate_webapp_data(init_data: str) -> Optional[Dict]:
+    """Validate Telegram WebApp initData"""
+    try:
+        parsed = dict(parse_qsl(init_data))
+        check_hash = parsed.pop('hash', '')
+        
+        data_check_string = '\n'.join(
+            f"{k}={v}" for k, v in sorted(parsed.items())
+        )
+        
+        secret_key = hmac.new(
+            b'WebAppData',
+            TG_BOT_TOKEN.encode(),
+            hashlib.sha256
+        ).digest()
+        
+        calculated_hash = hmac.new(
+            secret_key,
+            data_check_string.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        if calculated_hash == check_hash:
+            return json.loads(parsed.get('user', '{}'))
+        return None
+    except Exception as e:
+        logger.error(f"WebApp validation error: {e}")
+        return None
+
 # --- Database Module ---
 class Database:
     def __init__(self, db_path: str):

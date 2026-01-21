@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Helper Functions (MUST BE BEFORE Database class!) ---
+# --- Helper Functions (MOVED BEFORE Database class) ---
 def now_iso() -> str:
     """Return current UTC time in ISO format"""
     return datetime.utcnow().isoformat()
@@ -364,45 +364,6 @@ class Database:
 
 # Initialize DB
 db = Database(DB_PATH)
-
-def now_iso() -> str:
-    return datetime.utcnow().isoformat()
-
-def generate_order_number() -> str:
-    import random
-    return f"MS{datetime.now().strftime('%y%m%d')}{random.randint(1000, 9999)}"
-
-def is_admin(tg_id: int) -> bool:
-    return tg_id in ADMIN_IDS
-
-def validate_webapp_data(init_data: str) -> Optional[Dict]:
-    """Validate Telegram WebApp initData"""
-    try:
-        parsed = dict(parse_qsl(init_data))
-        check_hash = parsed.pop('hash', '')
-        
-        data_check_string = '\n'.join(
-            f"{k}={v}" for k, v in sorted(parsed.items())
-        )
-        
-        secret_key = hmac.new(
-            b'WebAppData',
-            TG_BOT_TOKEN.encode(),
-            hashlib.sha256
-        ).digest()
-        
-        calculated_hash = hmac.new(
-            secret_key,
-            data_check_string.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        
-        if calculated_hash == check_hash:
-            return json.loads(parsed.get('user', '{}'))
-        return None
-    except Exception as e:
-        logger.error(f"WebApp validation error: {e}")
-        return None
 
 # --- Keyboards ---
 def get_main_menu(user_id: int = None) -> ReplyKeyboardMarkup:
@@ -1174,6 +1135,12 @@ async def admin_order_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode='Markdown'
         )
 
+# --- Placeholder for review callback ---
+async def leave_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Placeholder for review system"""
+    query = update.callback_query
+    await query.answer("Функция отзывов в разработке", show_alert=True)
+
 # --- Text Router ---
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route text messages"""
@@ -1184,7 +1151,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     
     # Menu buttons
-    if text == '🛒 Корзина':
+    if text == '🛍 Каталог' or text.startswith('🛍'):
+        await catalog_handler(update, context)
+    elif text == '🛒 Корзина':
         await cart_handler(update, context)
     elif text == '👤 Профиль':
         await profile_handler(update, context)
@@ -1249,9 +1218,6 @@ def build_app():
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     
     return app
-
-async def leave_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass  # Implement review system
 
 if __name__ == "__main__":
     print("🚀 Starting Metro Shop Bot...")

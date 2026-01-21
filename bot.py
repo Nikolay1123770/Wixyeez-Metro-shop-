@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Metro Shop Telegram Bot - Ultimate Edition with MiniApp
+Metro Shop Bot - Single File Edition
+Для деплоя на Python хостинг
 """
 
 import os
 import sqlite3
 import logging
 import json
-import hashlib
-import hmac
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
-from urllib.parse import parse_qsl
+import asyncio
+from datetime import datetime
+from typing import Optional, Dict, List
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import threading
 
 from telegram import (
     InlineKeyboardButton,
@@ -20,8 +21,6 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     WebAppInfo,
-    MenuButtonWebApp,
-    InputMediaPhoto,
     Update,
 )
 from telegram.ext import (
@@ -32,1185 +31,984 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import BadRequest
 
-from config import *
+# ============== CONFIGURATION ==============
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAFN7bjp1094IVasTTkeYL3hkz4SYNgiQCY')
+OWNER_ID = int(os.getenv('OWNER_ID', '8473513085'))
+ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '-1003448809517'))
+DB_PATH = os.getenv('DB_PATH', 'metro_shop.db')
+SUPPORT_CONTACT = os.getenv('SUPPORT_CONTACT', '@wixyeez')
+WEBAPP_URL = os.getenv('WEBAPP_URL', '')  # Если есть MiniApp
 
-# --- Logging ---
+ADMIN_IDS = [OWNER_ID]
+WORKER_PERCENT = 0.7
+REFERRAL_PERCENT = 0.05
+
+# Payment
+PAYMENT_CARD = "+79002535363"
+PAYMENT_HOLDER = "Николай М"
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- Database Module ---
-class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.init_db()
+# ============== DATABASE ==============
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
     
-    def get_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    # Categories
+    cur.execute('''CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        emoji TEXT DEFAULT '📦',
+        sort_order INTEGER DEFAULT 0,
+        is_active INTEGER DEFAULT 1
+    )''')
     
-    def execute(self, query: str, params: tuple = (), fetch: bool = False):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute(query, params)
-        data = None
-        if fetch:
-            data = cur.fetchall()
-        else:
-            conn.commit()
-            data = cur.lastrowid
-        conn.close()
-        return data
+    # Users
+    cur.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tg_id INTEGER UNIQUE,
+        username TEXT,
+        first_name TEXT,
+        pubg_id TEXT,
+        balance REAL DEFAULT 0,
+        invited_by INTEGER,
+        referrals_count INTEGER DEFAULT 0,
+        registered_at TEXT
+    )''')
     
-    def fetchone(self, query: str, params: tuple = ()):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute(query, params)
-        row = cur.fetchone()
-        conn.close()
-        return dict(row) if row else None
+    # Products
+    cur.execute('''CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category_id INTEGER,
+        name TEXT NOT NULL,
+        description TEXT,
+        price REAL NOT NULL,
+        old_price REAL,
+        photo TEXT,
+        stock INTEGER DEFAULT -1,
+        is_active INTEGER DEFAULT 1,
+        sold_count INTEGER DEFAULT 0,
+        created_at TEXT
+    )''')
     
-    def fetchall(self, query: str, params: tuple = ()):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        conn.close()
-        return [dict(row) for row in rows]
+    # Cart
+    cur.execute('''CREATE TABLE IF NOT EXISTS cart (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        product_id INTEGER,
+        quantity INTEGER DEFAULT 1,
+        UNIQUE(user_id, product_id)
+    )''')
     
-    def init_db(self):
-        conn = self.get_connection()
-        cur = conn.cursor()
-        
-        # Categories
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            emoji TEXT DEFAULT '📦',
-            description TEXT,
-            sort_order INTEGER DEFAULT 0,
-            is_active INTEGER DEFAULT 1,
-            created_at TEXT
-        )
-        ''')
-        
-        # Users
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tg_id INTEGER UNIQUE,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            pubg_id TEXT,
-            phone TEXT,
-            registered_at TEXT,
-            last_active TEXT,
-            balance REAL DEFAULT 0,
-            total_spent REAL DEFAULT 0,
-            invited_by INTEGER,
-            referrals_count INTEGER DEFAULT 0,
-            is_banned INTEGER DEFAULT 0,
-            vip_until TEXT,
-            preferences TEXT DEFAULT '{}'
-        )
-        ''')
-        
-        # Products (Enhanced)
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_id INTEGER,
-            name TEXT NOT NULL,
-            short_description TEXT,
-            description TEXT,
-            price REAL NOT NULL,
-            old_price REAL,
-            photo TEXT,
-            photos TEXT DEFAULT '[]',
-            stock INTEGER DEFAULT -1,
-            is_active INTEGER DEFAULT 1,
-            is_featured INTEGER DEFAULT 0,
-            sort_order INTEGER DEFAULT 0,
-            sold_count INTEGER DEFAULT 0,
-            views_count INTEGER DEFAULT 0,
-            rating REAL DEFAULT 0,
-            reviews_count INTEGER DEFAULT 0,
-            tags TEXT DEFAULT '[]',
-            meta TEXT DEFAULT '{}',
-            created_at TEXT,
-            updated_at TEXT,
-            FOREIGN KEY (category_id) REFERENCES categories(id)
-        )
-        ''')
-        
-        # Cart
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS cart (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            product_id INTEGER,
-            quantity INTEGER DEFAULT 1,
-            added_at TEXT,
-            UNIQUE(user_id, product_id)
-        )
-        ''')
-        
-        # Favorites
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS favorites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            product_id INTEGER,
-            added_at TEXT,
-            UNIQUE(user_id, product_id)
-        )
-        ''')
-        
-        # Orders (Enhanced)
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_number TEXT UNIQUE,
-            user_id INTEGER,
-            items TEXT NOT NULL,
-            subtotal REAL,
-            discount_amount REAL DEFAULT 0,
-            balance_used REAL DEFAULT 0,
-            total REAL,
-            status TEXT DEFAULT 'pending',
-            payment_method TEXT,
-            payment_screenshot TEXT,
-            pubg_id TEXT,
-            notes TEXT,
-            admin_notes TEXT,
-            promo_code TEXT,
-            created_at TEXT,
-            paid_at TEXT,
-            started_at TEXT,
-            completed_at TEXT,
-            cancelled_at TEXT,
-            cancel_reason TEXT
-        )
-        ''')
-        
-        # Order Workers
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS order_workers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id INTEGER,
-            worker_id INTEGER,
-            worker_username TEXT,
-            status TEXT DEFAULT 'active',
-            taken_at TEXT,
-            completed_at TEXT,
-            earnings REAL DEFAULT 0
-        )
-        ''')
-        
-        # Reviews (Enhanced)
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id INTEGER,
-            product_id INTEGER,
-            user_id INTEGER,
-            worker_id INTEGER,
-            rating INTEGER,
-            text TEXT,
-            photos TEXT DEFAULT '[]',
-            is_verified INTEGER DEFAULT 0,
-            is_visible INTEGER DEFAULT 1,
-            admin_reply TEXT,
-            created_at TEXT
-        )
-        ''')
-        
-        # Promocodes (Enhanced)
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS promocodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE,
-            type TEXT DEFAULT 'percent',
-            value REAL,
-            min_order REAL DEFAULT 0,
-            max_discount REAL,
-            uses_total INTEGER DEFAULT -1,
-            uses_per_user INTEGER DEFAULT 1,
-            uses_count INTEGER DEFAULT 0,
-            valid_from TEXT,
-            valid_until TEXT,
-            is_active INTEGER DEFAULT 1,
-            created_at TEXT
-        )
-        ''')
-        
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS promocode_uses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            promo_id INTEGER,
-            user_id INTEGER,
-            order_id INTEGER,
-            discount_amount REAL,
-            used_at TEXT
-        )
-        ''')
-        
-        # Notifications
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            type TEXT,
-            title TEXT,
-            message TEXT,
-            data TEXT DEFAULT '{}',
-            is_read INTEGER DEFAULT 0,
-            created_at TEXT
-        )
-        ''')
-        
-        # Analytics
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS analytics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type TEXT,
-            user_id INTEGER,
-            data TEXT DEFAULT '{}',
-            created_at TEXT
-        )
-        ''')
-        
-        # Worker Payouts
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS worker_payouts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            worker_id INTEGER,
-            order_id INTEGER,
-            amount REAL,
-            status TEXT DEFAULT 'pending',
-            paid_at TEXT,
-            created_at TEXT
-        )
-        ''')
-        
-        # Insert default category if empty
-        cur.execute('SELECT COUNT(*) FROM categories')
-        if cur.fetchone()[0] == 0:
-            cur.execute('''
-                INSERT INTO categories (name, emoji, description, sort_order, created_at)
-                VALUES 
-                ('Буст', '🚀', 'Услуги по прокачке', 1, ?),
-                ('Валюта', '💰', 'Игровая валюта', 2, ?),
-                ('Предметы', '🎁', 'Игровые предметы', 3, ?),
-                ('VIP', '👑', 'VIP услуги', 4, ?)
-            ''', (now_iso(), now_iso(), now_iso(), now_iso()))
-        
+    # Favorites
+    cur.execute('''CREATE TABLE IF NOT EXISTS favorites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        product_id INTEGER,
+        UNIQUE(user_id, product_id)
+    )''')
+    
+    # Orders
+    cur.execute('''CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_number TEXT UNIQUE,
+        user_id INTEGER,
+        items TEXT,
+        total REAL,
+        balance_used REAL DEFAULT 0,
+        status TEXT DEFAULT 'pending',
+        payment_screenshot TEXT,
+        pubg_id TEXT,
+        created_at TEXT
+    )''')
+    
+    # Order Workers
+    cur.execute('''CREATE TABLE IF NOT EXISTS order_workers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER,
+        worker_id INTEGER,
+        worker_username TEXT,
+        taken_at TEXT
+    )''')
+    
+    # Promocodes
+    cur.execute('''CREATE TABLE IF NOT EXISTS promocodes (
+        code TEXT PRIMARY KEY,
+        discount_percent INTEGER,
+        uses_left INTEGER DEFAULT -1,
+        is_active INTEGER DEFAULT 1
+    )''')
+    
+    # Default categories
+    cur.execute('SELECT COUNT(*) FROM categories')
+    if cur.fetchone()[0] == 0:
+        cur.executemany('INSERT INTO categories (name, emoji, sort_order) VALUES (?, ?, ?)', [
+            ('🚀 Буст', '🚀', 1),
+            ('💰 Валюта', '💰', 2),
+            ('🎁 Предметы', '🎁', 3),
+            ('👑 VIP', '👑', 4),
+        ])
+    
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized")
+
+def db_query(query: str, params: tuple = (), fetch: bool = False):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(query, params)
+    result = None
+    if fetch:
+        result = [dict(row) for row in cur.fetchall()]
+    else:
         conn.commit()
-        conn.close()
+        result = cur.lastrowid
+    conn.close()
+    return result
 
-# Initialize DB
-db = Database(DB_PATH)
+def db_one(query: str, params: tuple = ()):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(query, params)
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
-def now_iso() -> str:
+def now_iso():
     return datetime.utcnow().isoformat()
 
-def generate_order_number() -> str:
+def gen_order_num():
     import random
-    return f"MS{datetime.now().strftime('%y%m%d')}{random.randint(1000, 9999)}"
+    return f"MS{datetime.now().strftime('%y%m%d')}{random.randint(1000,9999)}"
 
 def is_admin(tg_id: int) -> bool:
     return tg_id in ADMIN_IDS
 
-def validate_webapp_data(init_data: str) -> Optional[Dict]:
-    """Validate Telegram WebApp initData"""
-    try:
-        parsed = dict(parse_qsl(init_data))
-        check_hash = parsed.pop('hash', '')
-        
-        data_check_string = '\n'.join(
-            f"{k}={v}" for k, v in sorted(parsed.items())
-        )
-        
-        secret_key = hmac.new(
-            b'WebAppData',
-            TG_BOT_TOKEN.encode(),
-            hashlib.sha256
-        ).digest()
-        
-        calculated_hash = hmac.new(
-            secret_key,
-            data_check_string.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        
-        if calculated_hash == check_hash:
-            return json.loads(parsed.get('user', '{}'))
-        return None
-    except Exception as e:
-        logger.error(f"WebApp validation error: {e}")
-        return None
-
-# --- Keyboards ---
-def get_main_menu(user_id: int = None) -> ReplyKeyboardMarkup:
-    keyboard = [
-        [KeyboardButton('🛍 Каталог', web_app=WebAppInfo(url=f"{WEBAPP_URL}/catalog")),
-         KeyboardButton('🛒 Корзина')],
+# ============== KEYBOARDS ==============
+def main_menu(user_id: int = None):
+    buttons = [
+        [KeyboardButton('🛍 Каталог'), KeyboardButton('🛒 Корзина')],
         [KeyboardButton('👤 Профиль'), KeyboardButton('📦 Мои заказы')],
-        [KeyboardButton('💝 Избранное'), KeyboardButton('🎮 PUBG ID')],
-        [KeyboardButton('📞 Поддержка'), KeyboardButton('📄 Документы')]
+        [KeyboardButton('❤️ Избранное'), KeyboardButton('🎮 PUBG ID')],
+        [KeyboardButton('📞 Поддержка')]
     ]
-    
     if user_id and is_admin(user_id):
-        keyboard.append([KeyboardButton('⚙️ Админ-панель')])
-    
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        buttons.append([KeyboardButton('⚙️ Админка')])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-def get_admin_keyboard() -> ReplyKeyboardMarkup:
+def admin_menu():
     return ReplyKeyboardMarkup([
         [KeyboardButton('📊 Статистика'), KeyboardButton('📦 Все заказы')],
         [KeyboardButton('➕ Добавить товар'), KeyboardButton('📁 Категории')],
         [KeyboardButton('🏷 Промокоды'), KeyboardButton('📢 Рассылка')],
-        [KeyboardButton('👥 Пользователи'), KeyboardButton('💰 Выплаты')],
-        [KeyboardButton('⬅️ Главное меню')]
+        [KeyboardButton('⬅️ Назад')]
     ], resize_keyboard=True)
 
-def get_catalog_inline_keyboard(category_id: int = None) -> InlineKeyboardMarkup:
-    categories = db.fetchall('SELECT * FROM categories WHERE is_active=1 ORDER BY sort_order')
-    
-    buttons = []
-    for cat in categories:
-        emoji = cat['emoji'] or '📦'
-        is_selected = '✓ ' if category_id == cat['id'] else ''
-        buttons.append([InlineKeyboardButton(
-            f"{is_selected}{emoji} {cat['name']}",
-            callback_data=f"cat:{cat['id']}"
-        )])
-    
-    buttons.append([
-        InlineKeyboardButton('🔍 Поиск', callback_data='search'),
-        InlineKeyboardButton('🔥 Популярное', callback_data='popular')
-    ])
-    
-    return InlineKeyboardMarkup(buttons)
+def cancel_kb():
+    return ReplyKeyboardMarkup([[KeyboardButton('❌ Отмена')]], resize_keyboard=True)
 
-# --- Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ============== HANDLERS ==============
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
     
-    # Check/Register user
-    existing = db.fetchone('SELECT * FROM users WHERE tg_id=?', (user.id,))
+    existing = db_one('SELECT * FROM users WHERE tg_id=?', (user.id,))
     
     if not existing:
         referrer_id = None
         if args and args[0].startswith('ref'):
             try:
-                ref_tg_id = int(args[0][3:])
-                if ref_tg_id != user.id:
-                    referrer = db.fetchone('SELECT id FROM users WHERE tg_id=?', (ref_tg_id,))
-                    if referrer:
-                        referrer_id = referrer['id']
-                        db.execute('UPDATE users SET referrals_count = referrals_count + 1 WHERE id=?', (referrer_id,))
+                ref_tg = int(args[0][3:])
+                if ref_tg != user.id:
+                    ref = db_one('SELECT id FROM users WHERE tg_id=?', (ref_tg,))
+                    if ref:
+                        referrer_id = ref['id']
+                        db_query('UPDATE users SET referrals_count = referrals_count + 1 WHERE id=?', (referrer_id,))
                         try:
-                            await context.bot.send_message(
-                                ref_tg_id,
-                                f"🎉 По вашей ссылке зарегистрировался {user.first_name}!\n"
-                                f"Вы получите {int(REFERRAL_PERCENT*100)}% от его покупок."
-                            )
+                            await context.bot.send_message(ref_tg, f"🎉 По вашей ссылке зарегистрировался {user.first_name}!")
                         except: pass
             except: pass
         
-        db.execute('''
-            INSERT INTO users (tg_id, username, first_name, last_name, registered_at, last_active, invited_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user.id, user.username, user.first_name, user.last_name, now_iso(), now_iso(), referrer_id))
-        
-        # Log analytics
-        db.execute('INSERT INTO analytics (event_type, user_id, data, created_at) VALUES (?, ?, ?, ?)',
-                   ('registration', user.id, json.dumps({'referrer': referrer_id}), now_iso()))
-    else:
-        db.execute('UPDATE users SET last_active=?, username=? WHERE tg_id=?', 
-                   (now_iso(), user.username, user.id))
-    
-    # Welcome message
-    welcome_text = f"""
-🎮 **Добро пожаловать в Metro Shop!**
-
-Привет, {user.first_name}! 👋
-
-Мы — лучший сервис для Metro Royale:
-• 🚀 Буст и прокачка
-• 💰 Игровая валюта
-• 🎁 Редкие предметы
-• 👑 VIP-услуги
-
-**Нажми кнопку «🛍 Каталог» для просмотра товаров!**
-    """
+        db_query('''INSERT INTO users (tg_id, username, first_name, registered_at, invited_by) 
+                    VALUES (?, ?, ?, ?, ?)''',
+                 (user.id, user.username, user.first_name, now_iso(), referrer_id))
     
     await update.message.reply_text(
-        welcome_text,
+        f"🎮 **Добро пожаловать в Metro Shop!**\n\n"
+        f"Привет, {user.first_name}! 👋\n\n"
+        f"Мы — лучший сервис для Metro Royale:\n"
+        f"• 🚀 Буст и прокачка\n"
+        f"• 💰 Игровая валюта\n"
+        f"• 🎁 Редкие предметы\n\n"
+        f"Нажми **🛍 Каталог** для просмотра!",
         parse_mode='Markdown',
-        reply_markup=get_main_menu(user.id)
+        reply_markup=main_menu(user.id)
     )
 
-async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show catalog with categories"""
-    text = """
-📦 **Каталог товаров**
-
-Выберите категорию или воспользуйтесь поиском:
-    """
+async def catalog_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    categories = db_query('SELECT * FROM categories WHERE is_active=1 ORDER BY sort_order', fetch=True)
+    
+    buttons = []
+    for cat in categories:
+        buttons.append([InlineKeyboardButton(f"{cat['emoji']} {cat['name']}", callback_data=f"cat:{cat['id']}")])
+    buttons.append([InlineKeyboardButton('🔥 Все товары', callback_data='cat:all')])
     
     await update.message.reply_text(
-        text,
+        "📦 **Каталог**\n\nВыберите категорию:",
         parse_mode='Markdown',
-        reply_markup=get_catalog_inline_keyboard()
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show products in category"""
+async def category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    cat_id = int(query.data.split(':')[1])
+    cat_id = query.data.split(':')[1]
     
-    category = db.fetchone('SELECT * FROM categories WHERE id=?', (cat_id,))
-    if not category:
-        await query.message.reply_text("Категория не найдена.")
-        return
-    
-    products = db.fetchall('''
-        SELECT * FROM products 
-        WHERE category_id=? AND is_active=1 
-        ORDER BY is_featured DESC, sort_order, sold_count DESC
-    ''', (cat_id,))
+    if cat_id == 'all':
+        products = db_query('SELECT * FROM products WHERE is_active=1 ORDER BY sold_count DESC', fetch=True)
+        title = "🔥 Все товары"
+    else:
+        products = db_query('SELECT * FROM products WHERE category_id=? AND is_active=1', (int(cat_id),), fetch=True)
+        cat = db_one('SELECT * FROM categories WHERE id=?', (int(cat_id),))
+        title = f"{cat['emoji']} {cat['name']}" if cat else "Категория"
     
     if not products:
         await query.message.edit_text(
-            f"{category['emoji']} **{category['name']}**\n\nВ этой категории пока нет товаров.",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton('⬅️ Назад', callback_data='catalog')
-            ]])
+            f"{title}\n\n❌ Товаров нет",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='catalog')]])
         )
         return
     
-    # Send products
-    await query.message.edit_text(
-        f"{category['emoji']} **{category['name']}**\n\n{category['description'] or ''}\n\n"
-        f"Найдено товаров: {len(products)}",
-        parse_mode='Markdown'
-    )
+    await query.message.edit_text(f"{title}\n\nНайдено: {len(products)} товаров")
     
-    for product in products[:10]:  # Limit to 10
-        await send_product_card(query.message, product, context)
+    for p in products[:10]:
+        await send_product_card(query.message, p)
 
-async def send_product_card(message, product: Dict, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a product card"""
-    price_text = f"💰 {product['price']}₽"
-    if product['old_price'] and product['old_price'] > product['price']:
+async def send_product_card(message, product: dict):
+    price_text = f"💰 **{product['price']}₽**"
+    if product.get('old_price') and product['old_price'] > product['price']:
         discount = int((1 - product['price'] / product['old_price']) * 100)
-        price_text = f"💰 ~~{product['old_price']}₽~~ **{product['price']}₽** (-{discount}%)"
+        price_text = f"~~{product['old_price']}₽~~ **{product['price']}₽** (-{discount}%)"
     
-    stock_text = ""
-    if product['stock'] == 0:
-        stock_text = "\n❌ Нет в наличии"
-    elif product['stock'] > 0:
-        stock_text = f"\n📦 В наличии: {product['stock']} шт."
-    
-    rating_text = ""
-    if product['reviews_count'] > 0:
-        stars = '⭐' * int(product['rating'])
-        rating_text = f"\n{stars} ({product['rating']:.1f}) • {product['reviews_count']} отзывов"
-    
-    caption = f"""
-🔸 **{product['name']}**
-
-{product['short_description'] or ''}
-
-{price_text}{stock_text}{rating_text}
-🛒 Продано: {product['sold_count']}
-    """
+    caption = f"🔸 **{product['name']}**\n\n{price_text}\n🛒 Продано: {product['sold_count']}"
     
     buttons = [
-        [InlineKeyboardButton('🔍 Подробнее', callback_data=f"product:{product['id']}")],
+        [InlineKeyboardButton('🔍 Подробнее', callback_data=f"prod:{product['id']}")],
         [
-            InlineKeyboardButton('🛒 В корзину', callback_data=f"add_cart:{product['id']}"),
-            InlineKeyboardButton('❤️', callback_data=f"toggle_fav:{product['id']}")
+            InlineKeyboardButton('🛒 В корзину', callback_data=f"cart_add:{product['id']}"),
+            InlineKeyboardButton('❤️', callback_data=f"fav:{product['id']}")
         ]
     ]
     
-    if product['stock'] == 0:
-        buttons = [[InlineKeyboardButton('🔔 Уведомить о поступлении', callback_data=f"notify_stock:{product['id']}")]]
-    
-    kb = InlineKeyboardMarkup(buttons)
-    
-    if product['photo']:
+    if product.get('photo'):
         try:
-            await message.reply_photo(
-                photo=product['photo'],
-                caption=caption,
-                parse_mode='Markdown',
-                reply_markup=kb
-            )
-        except:
-            await message.reply_text(caption, parse_mode='Markdown', reply_markup=kb)
-    else:
-        await message.reply_text(caption, parse_mode='Markdown', reply_markup=kb)
+            await message.reply_photo(product['photo'], caption=caption, parse_mode='Markdown',
+                                     reply_markup=InlineKeyboardMarkup(buttons))
+            return
+        except: pass
+    
+    await message.reply_text(caption, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
 
-async def product_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show detailed product info"""
+async def product_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    product_id = int(query.data.split(':')[1])
-    product = db.fetchone('SELECT * FROM products WHERE id=?', (product_id,))
+    pid = int(query.data.split(':')[1])
+    p = db_one('SELECT * FROM products WHERE id=?', (pid,))
     
-    if not product:
-        await query.message.reply_text("Товар не найден.")
+    if not p:
+        await query.message.reply_text("❌ Товар не найден")
         return
     
-    # Update views
-    db.execute('UPDATE products SET views_count = views_count + 1 WHERE id=?', (product_id,))
+    price_text = f"💰 **{p['price']}₽**"
+    if p.get('old_price') and p['old_price'] > p['price']:
+        discount = int((1 - p['price'] / p['old_price']) * 100)
+        price_text = f"~~{p['old_price']}₽~~ **{p['price']}₽** (-{discount}%)"
     
-    # Get reviews
-    reviews = db.fetchall('''
-        SELECT r.*, u.username, u.first_name 
-        FROM reviews r 
-        JOIN users u ON r.user_id = u.tg_id 
-        WHERE r.product_id=? AND r.is_visible=1 
-        ORDER BY r.created_at DESC LIMIT 3
-    ''', (product_id,))
-    
-    price_text = f"💰 {product['price']}₽"
-    if product['old_price'] and product['old_price'] > product['price']:
-        discount = int((1 - product['price'] / product['old_price']) * 100)
-        price_text = f"💰 ~~{product['old_price']}₽~~ **{product['price']}₽** (-{discount}%)"
-    
-    caption = f"""
-🎯 **{product['name']}**
+    text = f"""
+🎯 **{p['name']}**
 
-📝 {product['description'] or product['short_description'] or 'Описание отсутствует'}
+📝 {p.get('description') or 'Описание отсутствует'}
 
 {price_text}
-📊 Просмотров: {product['views_count']} | Продано: {product['sold_count']}
-    """
-    
-    if reviews:
-        caption += "\n\n**Последние отзывы:**\n"
-        for r in reviews:
-            stars = '⭐' * r['rating']
-            name = r['first_name'] or r['username'] or 'Аноним'
-            caption += f"{stars} {name}: {r['text'][:50]}...\n"
-    
-    user = query.from_user
-    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
-    is_fav = db.fetchone('SELECT 1 FROM favorites WHERE user_id=? AND product_id=?', 
-                         (user_db['id'], product_id)) if user_db else False
-    
-    fav_text = '💔 Убрать' if is_fav else '❤️ В избранное'
+📦 Продано: {p['sold_count']}
+"""
     
     buttons = [
-        [InlineKeyboardButton(f'🛒 Купить за {product["price"]}₽', callback_data=f"buy:{product_id}")],
+        [InlineKeyboardButton(f"🛒 Купить за {p['price']}₽", callback_data=f"buy:{pid}")],
         [
-            InlineKeyboardButton('➕ В корзину', callback_data=f"add_cart:{product_id}"),
-            InlineKeyboardButton(fav_text, callback_data=f"toggle_fav:{product_id}")
+            InlineKeyboardButton('➕ В корзину', callback_data=f"cart_add:{pid}"),
+            InlineKeyboardButton('❤️ Избранное', callback_data=f"fav:{pid}")
         ],
-        [
-            InlineKeyboardButton('📝 Отзывы', callback_data=f"reviews:{product_id}"),
-            InlineKeyboardButton('⬅️ Назад', callback_data=f"cat:{product['category_id']}")
-        ]
+        [InlineKeyboardButton('⬅️ Назад', callback_data='catalog')]
     ]
     
-    if is_admin(user.id):
+    if is_admin(query.from_user.id):
         buttons.append([
-            InlineKeyboardButton('✏️ Редактировать', callback_data=f"edit_product:{product_id}"),
-            InlineKeyboardButton('🗑 Удалить', callback_data=f"delete_product:{product_id}")
+            InlineKeyboardButton('✏️ Изменить', callback_data=f"edit_prod:{pid}"),
+            InlineKeyboardButton('🗑 Удалить', callback_data=f"del_prod:{pid}")
         ])
     
-    kb = InlineKeyboardMarkup(buttons)
+    if p.get('photo'):
+        try:
+            await query.message.reply_photo(p['photo'], caption=text, parse_mode='Markdown',
+                                           reply_markup=InlineKeyboardMarkup(buttons))
+            return
+        except: pass
     
-    # Send with all photos if available
-    photos = json.loads(product['photos'] or '[]')
-    if product['photo']:
-        photos.insert(0, product['photo'])
-    
-    if len(photos) > 1:
-        media = [InputMediaPhoto(photos[0], caption=caption, parse_mode='Markdown')]
-        for p in photos[1:4]:
-            media.append(InputMediaPhoto(p))
-        await query.message.reply_media_group(media)
-        await query.message.reply_text('Выберите действие:', reply_markup=kb)
-    elif photos:
-        await query.message.reply_photo(photos[0], caption=caption, parse_mode='Markdown', reply_markup=kb)
-    else:
-        await query.message.reply_text(caption, parse_mode='Markdown', reply_markup=kb)
+    await query.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
 
-async def add_to_cart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add product to cart"""
+async def add_to_cart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    product_id = int(query.data.split(':')[1])
+    pid = int(query.data.split(':')[1])
     
-    user = query.from_user
-    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
-    
-    if not user_db:
-        await query.answer("Ошибка. Напишите /start", show_alert=True)
+    user = db_one('SELECT id FROM users WHERE tg_id=?', (query.from_user.id,))
+    if not user:
+        await query.answer("❌ Ошибка", show_alert=True)
         return
     
-    product = db.fetchone('SELECT * FROM products WHERE id=? AND is_active=1', (product_id,))
-    if not product:
-        await query.answer("Товар недоступен", show_alert=True)
-        return
-    
-    if product['stock'] == 0:
-        await query.answer("Товар закончился", show_alert=True)
-        return
-    
-    # Check if already in cart
-    existing = db.fetchone('SELECT * FROM cart WHERE user_id=? AND product_id=?', 
-                           (user_db['id'], product_id))
+    existing = db_one('SELECT * FROM cart WHERE user_id=? AND product_id=?', (user['id'], pid))
     
     if existing:
-        db.execute('UPDATE cart SET quantity = quantity + 1 WHERE id=?', (existing['id'],))
-        await query.answer("✅ Количество увеличено!")
+        db_query('UPDATE cart SET quantity = quantity + 1 WHERE id=?', (existing['id'],))
     else:
-        db.execute('INSERT INTO cart (user_id, product_id, quantity, added_at) VALUES (?, ?, 1, ?)',
-                   (user_db['id'], product_id, now_iso()))
-        await query.answer("✅ Добавлено в корзину!")
-
-async def cart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show user's cart"""
-    user = update.effective_user
-    user_db = db.fetchone('SELECT * FROM users WHERE tg_id=?', (user.id,))
+        db_query('INSERT INTO cart (user_id, product_id, quantity) VALUES (?, ?, 1)', (user['id'], pid))
     
-    if not user_db:
-        await update.message.reply_text("Ошибка. Напишите /start")
+    await query.answer("✅ Добавлено в корзину!")
+
+async def toggle_favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    pid = int(query.data.split(':')[1])
+    
+    user = db_one('SELECT id FROM users WHERE tg_id=?', (query.from_user.id,))
+    if not user:
+        await query.answer("❌ Ошибка", show_alert=True)
         return
     
-    cart_items = db.fetchall('''
-        SELECT c.*, p.name, p.price, p.photo 
-        FROM cart c 
-        JOIN products p ON c.product_id = p.id 
-        WHERE c.user_id=?
-    ''', (user_db['id'],))
+    existing = db_one('SELECT id FROM favorites WHERE user_id=? AND product_id=?', (user['id'], pid))
     
-    if not cart_items:
+    if existing:
+        db_query('DELETE FROM favorites WHERE id=?', (existing['id'],))
+        await query.answer("💔 Удалено из избранного")
+    else:
+        db_query('INSERT INTO favorites (user_id, product_id) VALUES (?, ?)', (user['id'], pid))
+        await query.answer("❤️ Добавлено в избранное!")
+
+async def cart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db_one('SELECT * FROM users WHERE tg_id=?', (update.effective_user.id,))
+    if not user:
+        await update.message.reply_text("❌ Ошибка")
+        return
+    
+    items = db_query('''
+        SELECT c.*, p.name, p.price, p.photo 
+        FROM cart c JOIN products p ON c.product_id = p.id 
+        WHERE c.user_id=?
+    ''', (user['id'],), fetch=True)
+    
+    if not items:
         await update.message.reply_text(
-            "🛒 **Ваша корзина пуста**\n\nДобавьте товары из каталога!",
+            "🛒 **Корзина пуста**\n\nДобавьте товары из каталога!",
             parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton('🛍 Открыть каталог', callback_data='catalog')
-            ]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🛍 Каталог', callback_data='catalog')]])
         )
         return
     
-    total = sum(item['price'] * item['quantity'] for item in cart_items)
+    total = sum(i['price'] * i['quantity'] for i in items)
     
     text = "🛒 **Ваша корзина:**\n\n"
     buttons = []
     
-    for item in cart_items:
-        subtotal = item['price'] * item['quantity']
-        text += f"• {item['name']}\n"
-        text += f"  {item['quantity']} × {item['price']}₽ = {subtotal}₽\n\n"
+    for item in items:
+        text += f"• {item['name']}\n  {item['quantity']} × {item['price']}₽ = {item['price'] * item['quantity']}₽\n\n"
         buttons.append([
-            InlineKeyboardButton(f"➖", callback_data=f"cart_minus:{item['product_id']}"),
+            InlineKeyboardButton("➖", callback_data=f"cart_minus:{item['product_id']}"),
             InlineKeyboardButton(f"{item['quantity']}", callback_data="noop"),
-            InlineKeyboardButton(f"➕", callback_data=f"cart_plus:{item['product_id']}"),
-            InlineKeyboardButton(f"🗑", callback_data=f"cart_remove:{item['product_id']}")
+            InlineKeyboardButton("➕", callback_data=f"cart_plus:{item['product_id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"cart_del:{item['product_id']}")
         ])
     
-    text += f"━━━━━━━━━━━━━━━\n💰 **Итого: {total}₽**"
+    text += f"━━━━━━━━━━━━━━\n💰 **Итого: {total}₽**"
     
-    if user_db['balance'] > 0:
-        text += f"\n💎 Ваш баланс: {user_db['balance']}₽"
+    if user['balance'] > 0:
+        text += f"\n💎 Ваш баланс: {user['balance']}₽"
     
-    buttons.append([InlineKeyboardButton('🗑 Очистить корзину', callback_data='cart_clear')])
-    buttons.append([InlineKeyboardButton(f'✅ Оформить заказ на {total}₽', callback_data='checkout')])
+    buttons.append([InlineKeyboardButton('🗑 Очистить', callback_data='cart_clear')])
+    buttons.append([InlineKeyboardButton(f'✅ Оформить ({total}₽)', callback_data='checkout')])
     
-    await update.message.reply_text(
-        text,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
 
-async def checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start checkout process"""
+async def cart_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data
+    
+    user = db_one('SELECT id FROM users WHERE tg_id=?', (query.from_user.id,))
+    if not user:
+        await query.answer("❌ Ошибка")
+        return
+    
+    if action == 'cart_clear':
+        db_query('DELETE FROM cart WHERE user_id=?', (user['id'],))
+        await query.answer("🗑 Корзина очищена")
+        await query.message.edit_text("🛒 Корзина пуста")
+        return
+    
+    if action.startswith('cart_plus:'):
+        pid = int(action.split(':')[1])
+        db_query('UPDATE cart SET quantity = quantity + 1 WHERE user_id=? AND product_id=?', (user['id'], pid))
+        await query.answer("➕")
+    elif action.startswith('cart_minus:'):
+        pid = int(action.split(':')[1])
+        item = db_one('SELECT quantity FROM cart WHERE user_id=? AND product_id=?', (user['id'], pid))
+        if item and item['quantity'] > 1:
+            db_query('UPDATE cart SET quantity = quantity - 1 WHERE user_id=? AND product_id=?', (user['id'], pid))
+        else:
+            db_query('DELETE FROM cart WHERE user_id=? AND product_id=?', (user['id'], pid))
+        await query.answer("➖")
+    elif action.startswith('cart_del:'):
+        pid = int(action.split(':')[1])
+        db_query('DELETE FROM cart WHERE user_id=? AND product_id=?', (user['id'], pid))
+        await query.answer("🗑 Удалено")
+    
+    # Refresh cart view
+    items = db_query('''
+        SELECT c.*, p.name, p.price FROM cart c 
+        JOIN products p ON c.product_id = p.id WHERE c.user_id=?
+    ''', (user['id'],), fetch=True)
+    
+    if not items:
+        await query.message.edit_text("🛒 Корзина пуста")
+        return
+    
+    total = sum(i['price'] * i['quantity'] for i in items)
+    text = "🛒 **Корзина:**\n\n"
+    buttons = []
+    
+    for item in items:
+        text += f"• {item['name']} ({item['quantity']}×{item['price']}₽)\n"
+        buttons.append([
+            InlineKeyboardButton("➖", callback_data=f"cart_minus:{item['product_id']}"),
+            InlineKeyboardButton(f"{item['quantity']}", callback_data="noop"),
+            InlineKeyboardButton("➕", callback_data=f"cart_plus:{item['product_id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"cart_del:{item['product_id']}")
+        ])
+    
+    text += f"\n💰 **Итого: {total}₽**"
+    buttons.append([InlineKeyboardButton(f'✅ Оформить ({total}₽)', callback_data='checkout')])
+    
+    await query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    user = query.from_user
-    user_db = db.fetchone('SELECT * FROM users WHERE tg_id=?', (user.id,))
+    user = db_one('SELECT * FROM users WHERE tg_id=?', (query.from_user.id,))
+    items = db_query('''
+        SELECT c.*, p.name, p.price, p.id as product_id 
+        FROM cart c JOIN products p ON c.product_id = p.id WHERE c.user_id=?
+    ''', (user['id'],), fetch=True)
     
-    cart_items = db.fetchall('''
-        SELECT c.*, p.name, p.price, p.id as product_id
-        FROM cart c 
-        JOIN products p ON c.product_id = p.id 
-        WHERE c.user_id=?
-    ''', (user_db['id'],))
-    
-    if not cart_items:
-        await query.message.reply_text("Корзина пуста!")
+    if not items:
+        await query.message.reply_text("❌ Корзина пуста")
         return
     
-    # Calculate totals
-    subtotal = sum(item['price'] * item['quantity'] for item in cart_items)
-    
-    # Apply promo if exists
-    discount = 0
-    promo_code = context.user_data.get('promo_code')
-    if promo_code:
-        promo = db.fetchone('SELECT * FROM promocodes WHERE code=? AND is_active=1', (promo_code,))
-        if promo:
-            if promo['type'] == 'percent':
-                discount = subtotal * (promo['value'] / 100)
-                if promo['max_discount']:
-                    discount = min(discount, promo['max_discount'])
-            else:
-                discount = promo['value']
-    
-    # Apply balance
-    balance_use = min(user_db['balance'], subtotal - discount)
-    
-    total = subtotal - discount - balance_use
+    total = sum(i['price'] * i['quantity'] for i in items)
+    balance_use = min(user['balance'], total)
+    final = total - balance_use
     
     # Create order
-    order_number = generate_order_number()
-    items_json = json.dumps([{
-        'product_id': item['product_id'],
-        'name': item['name'],
-        'price': item['price'],
-        'quantity': item['quantity']
-    } for item in cart_items])
+    order_num = gen_order_num()
+    items_json = json.dumps([{'id': i['product_id'], 'name': i['name'], 'price': i['price'], 'qty': i['quantity']} for i in items])
     
-    order_id = db.execute('''
-        INSERT INTO orders (order_number, user_id, items, subtotal, discount_amount, 
-                           balance_used, total, status, pubg_id, promo_code, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (order_number, user_db['id'], items_json, subtotal, discount, 
-          balance_use, total, 'awaiting_payment', user_db['pubg_id'], promo_code, now_iso()))
+    order_id = db_query('''
+        INSERT INTO orders (order_number, user_id, items, total, balance_used, status, pubg_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (order_num, user['id'], items_json, final, balance_use, 'awaiting_payment', user.get('pubg_id'), now_iso()))
     
     # Deduct balance
     if balance_use > 0:
-        db.execute('UPDATE users SET balance = balance - ? WHERE id=?', (balance_use, user_db['id']))
+        db_query('UPDATE users SET balance = balance - ? WHERE id=?', (balance_use, user['id']))
     
     # Clear cart
-    db.execute('DELETE FROM cart WHERE user_id=?', (user_db['id'],))
+    db_query('DELETE FROM cart WHERE user_id=?', (user['id'],))
     
-    # Store order in context
-    context.user_data['pending_order_id'] = order_id
-    context.user_data.pop('promo_code', None)
+    context.user_data['pending_order'] = order_id
     
-    # Payment message
     text = f"""
-📋 **Заказ #{order_number}**
+📋 **Заказ #{order_num}**
 
 📦 Товары:
 """
-    for item in cart_items:
-        text += f"• {item['name']} × {item['quantity']} = {item['price'] * item['quantity']}₽\n"
+    for i in items:
+        text += f"• {i['name']} × {i['quantity']} = {i['price'] * i['quantity']}₽\n"
     
-    text += f"\n━━━━━━━━━━━━━━━\n"
-    text += f"Подытог: {subtotal}₽\n"
-    if discount > 0:
-        text += f"🏷 Скидка: -{discount}₽\n"
+    text += f"\n━━━━━━━━━━━━━━\n"
     if balance_use > 0:
         text += f"💎 Баланс: -{balance_use}₽\n"
-    text += f"\n💰 **К оплате: {total}₽**\n"
+    text += f"💰 **К оплате: {final}₽**\n"
     
-    if total > 0:
+    if final > 0:
         text += f"""
-━━━━━━━━━━━━━━━
-💳 **Реквизиты для оплаты:**
+━━━━━━━━━━━━━━
+💳 **Реквизиты:**
+Сбербанк: `{PAYMENT_CARD}`
+Получатель: {PAYMENT_HOLDER}
 
-**{PAYMENT_BANK}:** `{PAYMENT_CARD}`
-**Получатель:** {PAYMENT_HOLDER}
-
-📸 После оплаты отправьте скриншот сюда!
+📸 **Отправьте скриншот оплаты!**
 """
         await query.message.reply_text(text, parse_mode='Markdown')
     else:
-        # Fully paid by balance
-        db.execute('UPDATE orders SET status=?, paid_at=? WHERE id=?', 
-                   ('paid', now_iso(), order_id))
-        await notify_admins_new_order(context, order_id)
-        text += "\n✅ **Заказ оплачен балансом!**\nОжидайте выполнения."
-        await query.message.reply_text(text, parse_mode='Markdown')
+        db_query('UPDATE orders SET status=? WHERE id=?', ('paid', order_id))
+        await notify_admins_order(context, order_id)
+        text += "\n✅ **Оплачено балансом!**"
+        await query.message.reply_text(text, parse_mode='Markdown', reply_markup=main_menu(query.from_user.id))
 
-async def profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show user profile"""
-    user = update.effective_user
-    user_db = db.fetchone('SELECT * FROM users WHERE tg_id=?', (user.id,))
-    
-    if not user_db:
-        await update.message.reply_text("Напишите /start для регистрации")
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db_one('SELECT id FROM users WHERE tg_id=?', (update.effective_user.id,))
+    if not user:
         return
     
-    # Get stats
-    orders_count = db.fetchone('SELECT COUNT(*) as cnt FROM orders WHERE user_id=?', (user_db['id'],))['cnt']
-    total_spent = db.fetchone('SELECT SUM(total) as total FROM orders WHERE user_id=? AND status="completed"', 
-                              (user_db['id'],))['total'] or 0
+    pending = db_one('''
+        SELECT * FROM orders WHERE user_id=? AND status='awaiting_payment' ORDER BY id DESC LIMIT 1
+    ''', (user['id'],))
     
-    ref_link = f"https://t.me/{context.bot.username}?start=ref{user.id}"
-    
-    text = f"""
-👤 **Ваш профиль**
-
-🆔 ID: `{user.id}`
-📝 Имя: {user.first_name} {user.last_name or ''}
-📅 В сервисе с: {user_db['registered_at'][:10]}
-
-💰 **Баланс: {user_db['balance']}₽**
-📦 Заказов: {orders_count}
-💸 Потрачено: {total_spent}₽
-
-👥 **Реферальная программа:**
-Приглашено: {user_db['referrals_count']} друзей
-Ваша ссылка: `{ref_link}`
-
-_Приглашайте друзей и получайте {int(REFERRAL_PERCENT*100)}% от их покупок!_
-"""
-    
-    buttons = [
-        [InlineKeyboardButton('🎮 Изменить PUBG ID', callback_data='edit_pubg')],
-        [InlineKeyboardButton('📊 История баланса', callback_data='balance_history')],
-        [InlineKeyboardButton('🔗 Поделиться ссылкой', switch_inline_query=ref_link)]
-    ]
-    
-    await update.message.reply_text(
-        text,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-async def favorites_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show user favorites"""
-    user = update.effective_user
-    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
-    
-    favorites = db.fetchall('''
-        SELECT p.* FROM favorites f 
-        JOIN products p ON f.product_id = p.id 
-        WHERE f.user_id=? AND p.is_active=1
-        ORDER BY f.added_at DESC
-    ''', (user_db['id'],))
-    
-    if not favorites:
-        await update.message.reply_text(
-            "💝 **Избранное пусто**\n\nДобавляйте товары в избранное, нажимая ❤️",
-            parse_mode='Markdown'
-        )
-        return
-    
-    await update.message.reply_text(f"💝 **Избранное** ({len(favorites)} товаров):", parse_mode='Markdown')
-    
-    for product in favorites:
-        await send_product_card(update.message, product, context)
-
-async def toggle_favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toggle product in favorites"""
-    query = update.callback_query
-    product_id = int(query.data.split(':')[1])
-    
-    user = query.from_user
-    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
-    
-    existing = db.fetchone('SELECT id FROM favorites WHERE user_id=? AND product_id=?',
-                           (user_db['id'], product_id))
-    
-    if existing:
-        db.execute('DELETE FROM favorites WHERE id=?', (existing['id'],))
-        await query.answer("💔 Удалено из избранного")
-    else:
-        db.execute('INSERT INTO favorites (user_id, product_id, added_at) VALUES (?, ?, ?)',
-                   (user_db['id'], product_id, now_iso()))
-        await query.answer("❤️ Добавлено в избранное!")
-
-async def my_orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show user's orders"""
-    user = update.effective_user
-    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
-    
-    orders = db.fetchall('''
-        SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 10
-    ''', (user_db['id'],))
-    
-    if not orders:
-        await update.message.reply_text("📦 У вас пока нет заказов")
-        return
-    
-    status_emoji = {
-        'awaiting_payment': '⏳',
-        'pending': '🔄',
-        'paid': '✅',
-        'in_progress': '🔨',
-        'delivering': '📦',
-        'completed': '✅',
-        'cancelled': '❌'
-    }
-    
-    text = "📦 **Ваши заказы:**\n\n"
-    buttons = []
-    
-    for order in orders:
-        emoji = status_emoji.get(order['status'], '❓')
-        items = json.loads(order['items'])
-        items_text = ', '.join([i['name'] for i in items[:2]])
-        if len(items) > 2:
-            items_text += f" +{len(items)-2}"
-        
-        text += f"{emoji} **#{order['order_number']}**\n"
-        text += f"   {items_text}\n"
-        text += f"   💰 {order['total']}₽ • {order['created_at'][:10]}\n\n"
-        
-        buttons.append([InlineKeyboardButton(
-            f"#{order['order_number']}", 
-            callback_data=f"order_detail:{order['id']}"
-        )])
-    
-    await update.message.reply_text(
-        text,
-        parse_mode='Markdown',
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle payment screenshots"""
-    user = update.effective_user
-    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
-    
-    if not user_db:
-        return
-    
-    # Find pending order
-    pending_order = db.fetchone('''
-        SELECT * FROM orders 
-        WHERE user_id=? AND status='awaiting_payment' 
-        ORDER BY created_at DESC LIMIT 1
-    ''', (user_db['id'],))
-    
-    if not pending_order:
+    if not pending:
+        # Maybe admin adding product photo
+        if context.user_data.get('adding_product'):
+            context.user_data['adding_product']['photo'] = update.message.photo[-1].file_id
+            await finish_add_product(update, context)
         return
     
     file_id = update.message.photo[-1].file_id
-    
-    db.execute('''
-        UPDATE orders SET status=?, payment_screenshot=? WHERE id=?
-    ''', ('pending', file_id, pending_order['id']))
+    db_query('UPDATE orders SET status=?, payment_screenshot=? WHERE id=?', ('pending', file_id, pending['id']))
     
     await update.message.reply_text(
-        "✅ **Скриншот получен!**\n\n"
-        "Ожидайте подтверждения оплаты администратором.",
+        "✅ **Скриншот получен!**\n\nОжидайте подтверждения.",
         parse_mode='Markdown',
-        reply_markup=get_main_menu(user.id)
+        reply_markup=main_menu(update.effective_user.id)
     )
     
-    # Notify admins
-    await notify_admins_new_order(context, pending_order['id'], file_id)
+    await notify_admins_order(context, pending['id'], file_id)
 
-async def notify_admins_new_order(context: ContextTypes.DEFAULT_TYPE, order_id: int, screenshot: str = None) -> None:
-    """Notify admins about new order"""
-    order = db.fetchone('SELECT * FROM orders WHERE id=?', (order_id,))
-    user = db.fetchone('SELECT * FROM users WHERE id=?', (order['user_id'],))
+async def notify_admins_order(context, order_id: int, screenshot: str = None):
+    order = db_one('SELECT * FROM orders WHERE id=?', (order_id,))
+    user = db_one('SELECT * FROM users WHERE id=?', (order['user_id'],))
     
     items = json.loads(order['items'])
-    items_text = '\n'.join([f"• {i['name']} × {i['quantity']} = {i['price'] * i['quantity']}₽" for i in items])
+    items_text = '\n'.join([f"• {i['name']} × {i['qty']}" for i in items])
     
     text = f"""
-🆕 **Новый заказ #{order['order_number']}**
+🆕 **Заказ #{order['order_number']}**
 
-👤 Покупатель: @{user['username'] or 'Нет username'} ({user['tg_id']})
-🎮 PUBG ID: {order['pubg_id'] or 'Не указан'}
+👤 @{user.get('username') or 'NoUsername'} (ID: {user['tg_id']})
+🎮 PUBG: {order.get('pubg_id') or 'Не указан'}
 
 📦 **Товары:**
 {items_text}
 
-💰 Подытог: {order['subtotal']}₽
+💰 **К оплате: {order['total']}₽**
 """
-    if order['discount_amount'] > 0:
-        text += f"🏷 Скидка: -{order['discount_amount']}₽\n"
     if order['balance_used'] > 0:
         text += f"💎 Баланс: -{order['balance_used']}₽\n"
-    text += f"\n**К оплате: {order['total']}₽**"
     
     buttons = [
         [
-            InlineKeyboardButton('✅ Подтвердить', callback_data=f"admin_confirm:{order_id}"),
-            InlineKeyboardButton('❌ Отклонить', callback_data=f"admin_reject:{order_id}")
+            InlineKeyboardButton('✅ Подтвердить', callback_data=f"adm_ok:{order_id}"),
+            InlineKeyboardButton('❌ Отклонить', callback_data=f"adm_no:{order_id}")
         ],
         [InlineKeyboardButton('📞 Связаться', url=f"tg://user?id={user['tg_id']}")]
     ]
     kb = InlineKeyboardMarkup(buttons)
     
     if screenshot:
-        await context.bot.send_photo(ADMIN_CHAT_ID, screenshot, caption=text, 
-                                     parse_mode='Markdown', reply_markup=kb)
+        await context.bot.send_photo(ADMIN_CHAT_ID, screenshot, caption=text, parse_mode='Markdown', reply_markup=kb)
     else:
         await context.bot.send_message(ADMIN_CHAT_ID, text, parse_mode='Markdown', reply_markup=kb)
 
-async def admin_order_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle admin order actions"""
+async def admin_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    action, order_id = query.data.split(':')
-    order_id = int(order_id)
+    action, oid = query.data.split(':')
+    oid = int(oid)
     
-    order = db.fetchone('SELECT * FROM orders WHERE id=?', (order_id,))
-    user = db.fetchone('SELECT * FROM users WHERE id=?', (order['user_id'],))
+    order = db_one('SELECT * FROM orders WHERE id=?', (oid,))
+    user = db_one('SELECT * FROM users WHERE id=?', (order['user_id'],))
     
-    if action == 'admin_confirm':
-        db.execute('UPDATE orders SET status=?, paid_at=? WHERE id=?', ('paid', now_iso(), order_id))
+    if action == 'adm_ok':
+        db_query('UPDATE orders SET status=? WHERE id=?', ('paid', oid))
         
-        # Handle referral bonus
-        if user['invited_by'] and order['total'] > 0:
+        # Referral bonus
+        if user.get('invited_by') and order['total'] > 0:
             bonus = order['total'] * REFERRAL_PERCENT
-            db.execute('UPDATE users SET balance = balance + ? WHERE id=?', (bonus, user['invited_by']))
-            referrer = db.fetchone('SELECT tg_id FROM users WHERE id=?', (user['invited_by'],))
-            if referrer:
+            db_query('UPDATE users SET balance = balance + ? WHERE id=?', (bonus, user['invited_by']))
+            ref = db_one('SELECT tg_id FROM users WHERE id=?', (user['invited_by'],))
+            if ref:
                 try:
-                    await context.bot.send_message(
-                        referrer['tg_id'],
-                        f"💰 Вам начислено +{bonus:.2f}₽ за покупку реферала!"
-                    )
+                    await context.bot.send_message(ref['tg_id'], f"💰 +{bonus:.0f}₽ за покупку реферала!")
                 except: pass
         
-        # Notify user
+        # Update sold count
+        items = json.loads(order['items'])
+        for i in items:
+            db_query('UPDATE products SET sold_count = sold_count + ? WHERE id=?', (i['qty'], i['id']))
+        
         try:
-            await context.bot.send_message(
-                user['tg_id'],
-                f"✅ **Оплата подтверждена!**\n\nЗаказ #{order['order_number']} принят в работу.",
-                parse_mode='Markdown'
-            )
+            await context.bot.send_message(user['tg_id'], f"✅ Заказ #{order['order_number']} подтвержден!")
         except: pass
         
-        await query.message.edit_caption(
-            caption=query.message.caption + "\n\n✅ **ОПЛАТА ПОДТВЕРЖДЕНА**",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('🟢 Взять', callback_data=f"worker_take:{order_id}")],
-                [
-                    InlineKeyboardButton('▶️ В работе', callback_data=f"status_progress:{order_id}"),
-                    InlineKeyboardButton('📦 Выдача', callback_data=f"status_deliver:{order_id}"),
-                    InlineKeyboardButton('✅ Готово', callback_data=f"status_done:{order_id}")
-                ]
-            ])
-        )
+        # Worker buttons
+        work_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('🟢 Взять', callback_data=f"work_take:{oid}")],
+            [
+                InlineKeyboardButton('▶️ В работе', callback_data=f"status_prog:{oid}"),
+                InlineKeyboardButton('📦 Выдача', callback_data=f"status_del:{oid}"),
+                InlineKeyboardButton('✅ Готово', callback_data=f"status_done:{oid}")
+            ]
+        ])
         
-    elif action == 'admin_reject':
-        # Refund balance
+        new_caption = query.message.caption + "\n\n✅ **ОПЛАТА ПОДТВЕРЖДЕНА**"
+        try:
+            await query.message.edit_caption(caption=new_caption, parse_mode='Markdown', reply_markup=work_kb)
+        except:
+            await query.message.edit_text(query.message.text + "\n\n✅ ПОДТВЕРЖДЕНО", reply_markup=work_kb)
+    
+    elif action == 'adm_no':
         if order['balance_used'] > 0:
-            db.execute('UPDATE users SET balance = balance + ? WHERE id=?', 
-                       (order['balance_used'], user['id']))
+            db_query('UPDATE users SET balance = balance + ? WHERE id=?', (order['balance_used'], user['id']))
         
-        db.execute('UPDATE orders SET status=?, cancelled_at=?, cancel_reason=? WHERE id=?',
-                   ('cancelled', now_iso(), 'Payment rejected', order_id))
+        db_query('UPDATE orders SET status=? WHERE id=?', ('cancelled', oid))
         
         try:
-            await context.bot.send_message(
-                user['tg_id'],
-                f"❌ Заказ #{order['order_number']} отклонен.\n"
-                f"Баланс возвращен." if order['balance_used'] > 0 else ""
-            )
+            await context.bot.send_message(user['tg_id'], f"❌ Заказ #{order['order_number']} отклонен.")
         except: pass
         
-        await query.message.edit_caption(
-            caption=query.message.caption + "\n\n❌ **ОТКЛОНЕНО**",
-            parse_mode='Markdown'
-        )
+        try:
+            await query.message.edit_caption(caption=query.message.caption + "\n\n❌ ОТКЛОНЕНО", parse_mode='Markdown')
+        except:
+            await query.message.edit_text(query.message.text + "\n\n❌ ОТКЛОНЕНО")
 
-# --- Text Router ---
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route text messages"""
+async def worker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action, oid = query.data.split(':')
+    oid = int(oid)
+    
+    if action == 'work_take':
+        existing = db_one('SELECT * FROM order_workers WHERE order_id=? AND worker_id=?', (oid, query.from_user.id))
+        if existing:
+            await query.answer("Вы уже взяли заказ")
+            return
+        
+        db_query('INSERT INTO order_workers (order_id, worker_id, worker_username, taken_at) VALUES (?, ?, ?, ?)',
+                 (oid, query.from_user.id, query.from_user.username, now_iso()))
+        await query.answer("✅ Вы взяли заказ!")
+    
+    elif action in ('status_prog', 'status_del', 'status_done'):
+        status_map = {'status_prog': 'in_progress', 'status_del': 'delivering', 'status_done': 'completed'}
+        new_status = status_map[action]
+        db_query('UPDATE orders SET status=? WHERE id=?', (new_status, oid))
+        
+        order = db_one('SELECT * FROM orders WHERE id=?', (oid,))
+        user = db_one('SELECT tg_id FROM users WHERE id=?', (order['user_id'],))
+        
+        msg_map = {'in_progress': '▶️ Заказ выполняется', 'delivering': '📦 Выдача товара', 'completed': '✅ Заказ выполнен!'}
+        
+        try:
+            kb = None
+            if new_status == 'completed':
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton('⭐ Оценить', callback_data=f"review:{oid}")]])
+            await context.bot.send_message(user['tg_id'], msg_map[new_status], reply_markup=kb)
+        except: pass
+        
+        await query.answer(f"Статус: {new_status}")
+
+async def profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db_one('SELECT * FROM users WHERE tg_id=?', (update.effective_user.id,))
+    if not user:
+        return
+    
+    orders = db_query('SELECT COUNT(*) as cnt FROM orders WHERE user_id=?', (user['id'],), fetch=True)[0]['cnt']
+    ref_link = f"https://t.me/{context.bot.username}?start=ref{update.effective_user.id}"
+    
+    text = f"""
+👤 **Профиль**
+
+🆔 ID: `{update.effective_user.id}`
+🎮 PUBG ID: {user.get('pubg_id') or 'Не указан'}
+
+💰 **Баланс: {user['balance']}₽**
+📦 Заказов: {orders}
+
+👥 **Рефералы:**
+Приглашено: {user['referrals_count']}
+Ссылка: `{ref_link}`
+
+_Получайте {int(REFERRAL_PERCENT*100)}% от покупок друзей!_
+"""
+    
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=main_menu(update.effective_user.id))
+
+async def favorites_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db_one('SELECT id FROM users WHERE tg_id=?', (update.effective_user.id,))
+    
+    favs = db_query('''
+        SELECT p.* FROM favorites f JOIN products p ON f.product_id = p.id 
+        WHERE f.user_id=? AND p.is_active=1
+    ''', (user['id'],), fetch=True)
+    
+    if not favs:
+        await update.message.reply_text("❤️ **Избранное пусто**", parse_mode='Markdown')
+        return
+    
+    await update.message.reply_text(f"❤️ **Избранное** ({len(favs)}):", parse_mode='Markdown')
+    for p in favs:
+        await send_product_card(update.message, p)
+
+async def orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db_one('SELECT id FROM users WHERE tg_id=?', (update.effective_user.id,))
+    orders = db_query('SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10', (user['id'],), fetch=True)
+    
+    if not orders:
+        await update.message.reply_text("📦 Заказов нет")
+        return
+    
+    status_emoji = {'awaiting_payment': '⏳', 'pending': '🔄', 'paid': '✅', 'in_progress': '🔨', 'delivering': '📦', 'completed': '✅', 'cancelled': '❌'}
+    
+    text = "📦 **Ваши заказы:**\n\n"
+    for o in orders:
+        emoji = status_emoji.get(o['status'], '❓')
+        text += f"{emoji} #{o['order_number']} — {o['total']}₽\n"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def pubg_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['awaiting_pubg'] = True
+    await update.message.reply_text("🎮 Введите ваш PUBG ID:", reply_markup=cancel_kb())
+
+async def support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"📞 **Поддержка**\n\nНаписать: {SUPPORT_CONTACT}", parse_mode='Markdown')
+
+# ============== ADMIN HANDLERS ==============
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("⚙️ **Админ-панель**", parse_mode='Markdown', reply_markup=admin_menu())
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    
+    users = db_query('SELECT COUNT(*) as cnt FROM users', fetch=True)[0]['cnt']
+    orders = db_query('SELECT COUNT(*) as cnt FROM orders', fetch=True)[0]['cnt']
+    revenue = db_query('SELECT SUM(total) as total FROM orders WHERE status="completed"', fetch=True)[0]['total'] or 0
+    
+    text = f"""
+📊 **Статистика**
+
+👥 Пользователей: {users}
+📦 Заказов: {orders}
+💰 Выручка: {revenue}₽
+"""
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def admin_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    
+    context.user_data['adding_product'] = {'step': 'name'}
+    await update.message.reply_text("📝 Введите название товара:", reply_markup=cancel_kb())
+
+async def finish_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data.get('adding_product', {})
+    
+    db_query('''
+        INSERT INTO products (category_id, name, description, price, photo, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (data.get('category', 1), data['name'], data.get('desc', ''), data['price'], data.get('photo'), now_iso()))
+    
+    context.user_data.pop('adding_product', None)
+    await update.message.reply_text("✅ Товар добавлен!", reply_markup=admin_menu())
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    
+    context.user_data['broadcast'] = True
+    await update.message.reply_text("📢 Введите текст рассылки:", reply_markup=cancel_kb())
+
+async def admin_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    
+    promos = db_query('SELECT * FROM promocodes', fetch=True)
+    text = "🏷 **Промокоды:**\n\n"
+    
+    if promos:
+        for p in promos:
+            text += f"`{p['code']}` — {p['discount_percent']}%\n"
+    else:
+        text += "Промокодов нет\n"
+    
+    text += "\n/addpromo CODE PERCENT — добавить"
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def add_promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Формат: /addpromo CODE PERCENT")
+        return
+    
+    code, percent = context.args[0].upper(), int(context.args[1])
+    db_query('INSERT OR REPLACE INTO promocodes (code, discount_percent) VALUES (?, ?)', (code, percent))
+    await update.message.reply_text(f"✅ Промокод `{code}` создан ({percent}%)", parse_mode='Markdown')
+
+async def admin_orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    
+    orders = db_query('SELECT * FROM orders ORDER BY id DESC LIMIT 10', fetch=True)
+    
+    status_emoji = {'awaiting_payment': '⏳', 'pending': '🔄', 'paid': '✅', 'in_progress': '🔨', 'delivering': '📦', 'completed': '✅', 'cancelled': '❌'}
+    
+    text = "📦 **Последние заказы:**\n\n"
+    for o in orders:
+        emoji = status_emoji.get(o['status'], '❓')
+        text += f"{emoji} #{o['order_number']} — {o['total']}₽\n"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+# ============== TEXT ROUTER ==============
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     
     text = update.message.text.strip()
     user = update.effective_user
     
+    # Cancel
+    if text == '❌ Отмена':
+        context.user_data.clear()
+        await update.message.reply_text("Отменено", reply_markup=main_menu(user.id))
+        return
+    
+    # Adding product flow
+    if context.user_data.get('adding_product'):
+        data = context.user_data['adding_product']
+        step = data['step']
+        
+        if step == 'name':
+            data['name'] = text
+            data['step'] = 'price'
+            await update.message.reply_text("💰 Введите цену:")
+        elif step == 'price':
+            try:
+                data['price'] = float(text)
+            except:
+                await update.message.reply_text("❌ Введите число")
+                return
+            data['step'] = 'desc'
+            await update.message.reply_text("📝 Введите описание:")
+        elif step == 'desc':
+            data['desc'] = text
+            data['step'] = 'photo'
+            await update.message.reply_text("📷 Отправьте фото товара:")
+        return
+    
+    # Broadcast
+    if context.user_data.get('broadcast'):
+        context.user_data.pop('broadcast')
+        users = db_query('SELECT tg_id FROM users', fetch=True)
+        count = 0
+        for u in users:
+            try:
+                await context.bot.send_message(u['tg_id'], f"📢 **Рассылка:**\n\n{text}", parse_mode='Markdown')
+                count += 1
+            except: pass
+        await update.message.reply_text(f"✅ Отправлено: {count}", reply_markup=admin_menu())
+        return
+    
+    # PUBG ID
+    if context.user_data.get('awaiting_pubg'):
+        context.user_data.pop('awaiting_pubg')
+        db_query('UPDATE users SET pubg_id=? WHERE tg_id=?', (text, user.id))
+        await update.message.reply_text(f"✅ PUBG ID сохранен: `{text}`", parse_mode='Markdown', reply_markup=main_menu(user.id))
+        return
+    
     # Menu buttons
-    if text == '🛒 Корзина':
+    if text == '🛍 Каталог':
+        await catalog_handler(update, context)
+    elif text == '🛒 Корзина':
         await cart_handler(update, context)
     elif text == '👤 Профиль':
         await profile_handler(update, context)
     elif text == '📦 Мои заказы':
-        await my_orders_handler(update, context)
-    elif text == '💝 Избранное':
+        await orders_handler(update, context)
+    elif text == '❤️ Избранное':
         await favorites_handler(update, context)
     elif text == '🎮 PUBG ID':
-        context.user_data['awaiting_pubg'] = True
-        await update.message.reply_text(
-            "🎮 Введите ваш PUBG ID:",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton('⬅️ Отмена')]], resize_keyboard=True)
-        )
+        await pubg_id_handler(update, context)
     elif text == '📞 Поддержка':
-        await update.message.reply_text(
-            f"📞 **Поддержка**\n\nНаписать: {SUPPORT_CONTACT_USER}",
-            parse_mode='Markdown'
-        )
-    elif text == '📄 Документы':
-        await update.message.reply_text(
-            "📄 **Документы**",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('📜 Пользовательское соглашение', callback_data='doc_terms')],
-                [InlineKeyboardButton('🔒 Политика конфиденциальности', callback_data='doc_privacy')]
-            ])
-        )
-    elif text == '⚙️ Админ-панель' and is_admin(user.id):
-        await update.message.reply_text("⚙️ Админ-панель:", reply_markup=get_admin_keyboard())
-    elif text == '⬅️ Главное меню' or text == '⬅️ Отмена':
-        context.user_data.clear()
-        await update.message.reply_text("Главное меню:", reply_markup=get_main_menu(user.id))
-    elif context.user_data.get('awaiting_pubg'):
-        db.execute('UPDATE users SET pubg_id=? WHERE tg_id=?', (text, user.id))
-        context.user_data.pop('awaiting_pubg')
-        await update.message.reply_text(
-            f"✅ PUBG ID сохранен: `{text}`",
-            parse_mode='Markdown',
-            reply_markup=get_main_menu(user.id)
-        )
+        await support_handler(update, context)
+    elif text == '⚙️ Админка' and is_admin(user.id):
+        await admin_panel(update, context)
+    elif text == '📊 Статистика' and is_admin(user.id):
+        await admin_stats(update, context)
+    elif text == '➕ Добавить товар' and is_admin(user.id):
+        await admin_add_product(update, context)
+    elif text == '📦 Все заказы' and is_admin(user.id):
+        await admin_orders_list(update, context)
+    elif text == '🏷 Промокоды' and is_admin(user.id):
+        await admin_promo(update, context)
+    elif text == '📢 Рассылка' and is_admin(user.id):
+        await admin_broadcast(update, context)
+    elif text == '⬅️ Назад':
+        await update.message.reply_text("Меню:", reply_markup=main_menu(user.id))
     else:
-        await update.message.reply_text("Используйте меню для навигации", reply_markup=get_main_menu(user.id))
+        await update.message.reply_text("Используйте меню", reply_markup=main_menu(user.id))
 
-# --- Build App ---
-def build_app():
+# ============== MAIN ==============
+
+def main():
+    init_db()
+    
     app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
     
     # Commands
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('addpromo', add_promo_command))
     
     # Callbacks
     app.add_handler(CallbackQueryHandler(category_callback, pattern=r'^cat:'))
-    app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^product:'))
-    app.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern=r'^add_cart:'))
-    app.add_handler(CallbackQueryHandler(toggle_favorite_callback, pattern=r'^toggle_fav:'))
+    app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^prod:'))
+    app.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern=r'^cart_add:'))
+    app.add_handler(CallbackQueryHandler(toggle_favorite_callback, pattern=r'^fav:'))
+    app.add_handler(CallbackQueryHandler(cart_action_callback, pattern=r'^cart_'))
     app.add_handler(CallbackQueryHandler(checkout_callback, pattern=r'^checkout'))
-    app.add_handler(CallbackQueryHandler(admin_order_action, pattern=r'^admin_'))
-    app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^leave_review:'))
+    app.add_handler(CallbackQueryHandler(admin_order_callback, pattern=r'^adm_'))
+    app.add_handler(CallbackQueryHandler(worker_callback, pattern=r'^(work_|status_)'))
     
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     
-    return app
+    logger.info("🚀 Bot starting...")
+    app.run_polling()
 
-async def leave_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass  # Implement review system
-
-if __name__ == "__main__":
-    print("🚀 Starting Metro Shop Bot...")
-    application = build_app()
-    application.run_polling()
+if __name__ == '__main__':
+    main()

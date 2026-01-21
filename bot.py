@@ -4209,7 +4209,7 @@ def build_bot_app():
     app.add_handler(CallbackQueryHandler(set_promo_type, pattern=r'^set_promo_type:'))
     app.add_handler(CallbackQueryHandler(save_promocode_handler, pattern=r'^save_promocode$'))
     app.add_handler(CallbackQueryHandler(delete_promocode_handler, pattern=r'^delete_promocode:'))
-        app.add_handler(CallbackQueryHandler(confirm_delete_promocode, pattern=r'^confirm_delete_promocode:'))
+    app.add_handler(CallbackQueryHandler(confirm_delete_promocode, pattern=r'^confirm_delete_promocode:'))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_code_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_value_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_min_order_handler))

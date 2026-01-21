@@ -4080,14 +4080,135 @@ async def reject_payout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.message.edit_text(f"❌ Выплата #{payout_id} отклонена")
 
 # ============== UPDATE BOT APP WITH ADMIN HANDLERS ==============
+async def mark_payout_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    payout_id = int(query.data.split(':')[1])
+
+    payout = db.fetchone('SELECT * FROM worker_payouts WHERE id=?', (payout_id,))
+    if not payout:
+        await query.answer("Выплата не найдена", show_alert=True)
+        return
+
+    db.execute('UPDATE worker_payouts SET status=?, paid_at=? WHERE id=?', ('paid', now_iso(), payout_id))
+
+    worker = db.fetchone('SELECT * FROM users WHERE id=?', (payout['worker_id'],))
+    if worker:
+        try:
+            await context.bot.send_message(
+                worker['tg_id'],
+                f"💰 Вам выплачено {payout['amount']}₽ за выполнение заказа!"
+            )
+        except:
+            pass
+
+    await query.message.edit_text(f"✅ Выплата #{payout_id} отмечена как выплаченная")
+
+async def reject_payout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    payout_id = int(query.data.split(':')[1])
+
+    payout = db.fetchone('SELECT * FROM worker_payouts WHERE id=?', (payout_id,))
+    if not payout:
+        await query.answer("Выплата не найдена", show_alert=True)
+        return
+
+    db.execute('UPDATE worker_payouts SET status=? WHERE id=?', ('rejected', payout_id))
+
+    await query.message.edit_text(f"❌ Выплата #{payout_id} отклонена")
+
+# ============== ADMIN PANEL CANCEL FUNCTIONS ==============
+async def cancel_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('adding_product', None)
+    context.user_data.pop('product_data', None)
+    await query.message.edit_text("❌ Добавление товара отменено", reply_markup=get_admin_keyboard())
+
+async def cancel_edit_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('editing_product', None)
+    context.user_data.pop('product_data', None)
+    await query.message.edit_text("❌ Редактирование товара отменено", reply_markup=get_admin_keyboard())
+
+async def cancel_add_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('adding_category', None)
+    context.user_data.pop('category_data', None)
+    await query.message.edit_text("❌ Добавление категории отменено", reply_markup=get_admin_keyboard())
+
+async def cancel_edit_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('editing_category', None)
+    context.user_data.pop('category_data', None)
+    await query.message.edit_text("❌ Редактирование категории отменено", reply_markup=get_admin_keyboard())
+
+async def cancel_add_promocode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('adding_promocode', None)
+    context.user_data.pop('promocode_data', None)
+    await query.message.edit_text("❌ Добавление промокода отменено", reply_markup=get_admin_keyboard())
+
+async def cancel_edit_promocode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('editing_promocode', None)
+    context.user_data.pop('promocode_data', None)
+    await query.message.edit_text("❌ Редактирование промокода отменено", reply_markup=get_admin_keyboard())
+
+async def cancel_add_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('adding_balance', None)
+    await query.message.edit_text("❌ Пополнение баланса отменено", reply_markup=get_admin_keyboard())
+
+async def cancel_withdraw_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('withdrawing_balance', None)
+    await query.message.edit_text("❌ Вывод средств отменен", reply_markup=get_admin_keyboard())
+
+async def cancel_grant_vip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('granting_vip', None)
+    await query.message.edit_text("❌ Выдача VIP отменена", reply_markup=get_admin_keyboard())
+
+async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('broadcasting', None)
+    context.user_data.pop('broadcast_type', None)
+    context.user_data.pop('broadcast_text', None)
+    context.user_data.pop('broadcast_photo', None)
+    await query.message.edit_text("❌ Рассылка отменена", reply_markup=get_admin_keyboard())
+
+async def skip_broadcast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.message.edit_text(
+        "Введите текст сообщения для рассылки:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_broadcast')]])
+    )
+
+async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.message.edit_text("✅ Действие отменено", reply_markup=get_admin_keyboard())
+
+# ============== UPDATE BOT APP WITH ADMIN HANDLERS ==============
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
-        
+
     text = update.message.text.strip()
     user = update.effective_user
-    
+
     if text == '🛍 Каталог' or text.startswith('🛍'):
         await catalog_handler(update, context)
     elif text == '🛒 Корзина':
@@ -4116,7 +4237,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ])
         )
     elif text == '⚙️ Админ-панель' and is_admin(user.id):
-        await update.message.reply_text("⚙️ Админ-панель:", reply_markup=get_admin_keyboard())
+        await admin_panel(update, context)
     elif text == '⬅️ Главное меню' or text == '⬅️ Отмена':
         context.user_data.clear()
         await update.message.reply_text("Главное меню:", reply_markup=get_main_menu(user.id))
@@ -4124,11 +4245,155 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         db.execute('UPDATE users SET pubg_id=? WHERE tg_id=?', (text, user.id))
         context.user_data.pop('awaiting_pubg')
         await update.message.reply_text(f"✅ PUBG ID сохранен: `{text}`", parse_mode='Markdown', reply_markup=get_main_menu(user.id))
+    elif context.user_data.get('adding_product'):
+        if 'product_data' in context.user_data:
+            if not context.user_data['product_data']['category_id']:
+                await set_product_category(update, context)
+            elif not context.user_data['product_data']['name']:
+                await product_name_handler(update, context)
+            elif not context.user_data['product_data']['price']:
+                await product_price_handler(update, context)
+            elif context.user_data['product_data']['old_price'] is None:
+                await product_old_price_handler(update, context)
+            elif not context.user_data['product_data']['short_description']:
+                await product_short_desc_handler(update, context)
+            elif not context.user_data['product_data']['description']:
+                await product_desc_handler(update, context)
+    elif context.user_data.get('editing_product'):
+        if context.user_data.get('editing_field') == 'name':
+            context.user_data['product_data']['name'] = text
+            context.user_data.pop('editing_field')
+            await edit_product_handler(update, context)
+        elif context.user_data.get('editing_field') == 'price':
+            try:
+                context.user_data['product_data']['price'] = float(text)
+                context.user_data.pop('editing_field')
+                await edit_product_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректная цена. Введите число.")
+        elif context.user_data.get('editing_field') == 'old_price':
+            try:
+                context.user_data['product_data']['old_price'] = float(text)
+                context.user_data.pop('editing_field')
+                await edit_product_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректная цена. Введите число.")
+        elif context.user_data.get('editing_field') == 'short_description':
+            context.user_data['product_data']['short_description'] = text
+            context.user_data.pop('editing_field')
+            await edit_product_handler(update, context)
+        elif context.user_data.get('editing_field') == 'description':
+            context.user_data['product_data']['description'] = text
+            context.user_data.pop('editing_field')
+            await edit_product_handler(update, context)
+        elif context.user_data.get('editing_field') == 'stock':
+            try:
+                context.user_data['product_data']['stock'] = int(text)
+                context.user_data.pop('editing_field')
+                await edit_product_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректное количество. Введите целое число.")
+    elif context.user_data.get('adding_category'):
+        if not context.user_data['category_data']['name']:
+            await category_name_handler(update, context)
+        elif not context.user_data['category_data']['emoji']:
+            await category_emoji_handler(update, context)
+        elif not context.user_data['category_data']['description']:
+            await category_desc_handler(update, context)
+        elif not context.user_data['category_data']['sort_order']:
+            await category_sort_order_handler(update, context)
+    elif context.user_data.get('editing_category'):
+        if context.user_data.get('editing_field') == 'name':
+            context.user_data['category_data']['name'] = text
+            context.user_data.pop('editing_field')
+            await edit_category_handler(update, context)
+        elif context.user_data.get('editing_field') == 'emoji':
+            context.user_data['category_data']['emoji'] = text
+            context.user_data.pop('editing_field')
+            await edit_category_handler(update, context)
+        elif context.user_data.get('editing_field') == 'description':
+            context.user_data['category_data']['description'] = text
+            context.user_data.pop('editing_field')
+            await edit_category_handler(update, context)
+        elif context.user_data.get('editing_field') == 'sort_order':
+            try:
+                context.user_data['category_data']['sort_order'] = int(text)
+                context.user_data.pop('editing_field')
+                await edit_category_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректное число. Введите целое число.")
+    elif context.user_data.get('adding_promocode'):
+        if not context.user_data['promocode_data']['code']:
+            await promocode_code_handler(update, context)
+        elif not context.user_data['promocode_data']['value']:
+            await promocode_value_handler(update, context)
+        elif context.user_data['promocode_data']['min_order'] is None:
+            await promocode_min_order_handler(update, context)
+        elif context.user_data['promocode_data']['type'] == 'percent' and context.user_data['promocode_data']['max_discount'] is None:
+            await promocode_max_discount_handler(update, context)
+        elif context.user_data['promocode_data']['uses_total'] is None:
+            await promocode_uses_total_handler(update, context)
+        elif context.user_data['promocode_data']['uses_per_user'] is None:
+            await promocode_uses_per_user_handler(update, context)
+    elif context.user_data.get('editing_promocode'):
+        if context.user_data.get('editing_field') == 'code':
+            context.user_data['promocode_data']['code'] = text
+            context.user_data.pop('editing_field')
+            await edit_promocode_handler(update, context)
+        elif context.user_data.get('editing_field') == 'value':
+            try:
+                context.user_data['promocode_data']['value'] = float(text)
+                context.user_data.pop('editing_field')
+                await edit_promocode_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректное значение. Введите число.")
+        elif context.user_data.get('editing_field') == 'min_order':
+            try:
+                context.user_data['promocode_data']['min_order'] = float(text)
+                context.user_data.pop('editing_field')
+                await edit_promocode_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректное значение. Введите число.")
+        elif context.user_data.get('editing_field') == 'max_discount':
+            try:
+                context.user_data['promocode_data']['max_discount'] = float(text)
+                context.user_data.pop('editing_field')
+                await edit_promocode_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректное значение. Введите число.")
+        elif context.user_data.get('editing_field') == 'uses_total':
+            try:
+                context.user_data['promocode_data']['uses_total'] = int(text)
+                context.user_data.pop('editing_field')
+                await edit_promocode_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректное значение. Введите целое число.")
+        elif context.user_data.get('editing_field') == 'uses_per_user':
+            try:
+                context.user_data['promocode_data']['uses_per_user'] = int(text)
+                context.user_data.pop('editing_field')
+                await edit_promocode_handler(update, context)
+            except ValueError:
+                await update.message.reply_text("Некорректное значение. Введите целое число.")
+        elif context.user_data.get('editing_field') == 'valid_until':
+            if text:
+                try:
+                    datetime.strptime(text, '%Y-%m-%d')
+                    context.user_data['promocode_data']['valid_until'] = text
+                except ValueError:
+                    await update.message.reply_text("Некорректный формат даты. Используйте YYYY-MM-DD")
+                    return
+            else:
+                context.user_data['promocode_data']['valid_until'] = None
+            context.user_data.pop('editing_field')
+            await edit_promocode_handler(update, context)
+    elif context.user_data.get('adding_balance'):
+        await add_balance_amount_handler(update, context)
+    elif context.user_data.get('withdrawing_balance'):
+        await withdraw_balance_amount_handler(update, context)
     else:
         await update.message.reply_text("Используйте меню для навигации", reply_markup=get_main_menu(user.id))
 
-        
-        
 
 def build_bot_app():
     app = ApplicationBuilder().token(TG_BOT_TOKEN).build()

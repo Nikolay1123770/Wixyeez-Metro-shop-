@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Metro Shop</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1 class="logo">🎮 Metro Shop</h1>
+                <div class="header-actions">
+                    <button class="icon-btn" onclick="openSearch()">
+                        <i class="fas fa-search"></i>
+                    </button>
+                    <button class="icon-btn cart-btn" onclick="openCart()">
+                        <i class="fas fa-shopping-cart"></i>
+                        <span class="cart-badge" id="cartBadge">0</span>
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Search Modal -->
+        <div id="searchModal" class="modal">
+            <div class="modal-content search-modal">
+                <div class="search-header">
+                    <input type="text" id="searchInput" placeholder="Поиск товаров..." autofocus>
+                    <button onclick="closeSearch()"><i class="fas fa-times"></i></button>
+                </div>
+                <div id="searchResults" class="search-results"></div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Categories -->
+            <section class="categories-section">
+                <div class="categories-scroll" id="categoriesContainer">
+                    <button class="category-chip active" data-id="all" onclick="selectCategory('all')">
+                        🔥 Все
+                    </button>
+                </div>
+            </section>
+
+            <!-- Sort & Filter -->
+            <section class="filter-section">
+                <select id="sortSelect" onchange="sortProducts()">
+                    <option value="popular">🔥 Популярные</option>
+                    <option value="new">🆕 Новинки</option>
+                    <option value="price_asc">💰 Сначала дешевые</option>
+                    <option value="price_desc">💎 Сначала дорогие</option>
+                    <option value="rating">⭐ По рейтингу</option>
+                </select>
+            </section>
+
+            <!-- Products Grid -->
+            <section class="products-section">
+                <div class="products-grid" id="productsGrid">
+                    <!-- Products will be loaded here -->
+                </div>
+                <div class="loading" id="loadingIndicator">
+                    <div class="spinner"></div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Product Detail Modal -->
+        <div id="productModal" class="modal">
+            <div class="modal-content product-modal">
+                <button class="close-btn" onclick="closeProductModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+                <div id="productDetail"></div>
+            </div>
+        </div>
+
+        <!-- Cart Modal -->
+        <div id="cartModal" class="modal">
+            <div class="modal-content cart-modal">
+                <div class="modal-header">
+                    <h2>🛒 Корзина</h2>
+                    <button onclick="closeCart()"><i class="fas fa-times"></i></button>
+                </div>
+                <div id="cartContent"></div>
+            </div>
+        </div>
+
+        <!-- Bottom Navigation -->
+        <nav class="bottom-nav">
+            <button class="nav-item active" onclick="showCatalog()">
+                <i class="fas fa-store"></i>
+                <span>Каталог</span>
+            </button>
+            <button class="nav-item" onclick="showFavorites()">
+                <i class="fas fa-heart"></i>
+                <span>Избранное</span>
+            </button>
+            <button class="nav-item" onclick="openCart()">
+                <i class="fas fa-shopping-cart"></i>
+                <span>Корзина</span>
+            </button>
+            <button class="nav-item" onclick="showProfile()">
+                <i class="fas fa-user"></i>
+                <span>Профиль</span>
+            </button>
+        </nav>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

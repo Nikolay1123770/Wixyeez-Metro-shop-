@@ -2,7 +2,7 @@
 import os
 
 # Bot Settings
-TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAFLKT39qdkKR81df5nEYuCFIk3z8kdZbSo')
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAFN7bjp1094IVasTTkeYL3hkz4SYNgiQCY')
 OWNER_ID = int(os.getenv('OWNER_ID', '8473513085'))
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '-1003448809517'))
 DB_PATH = os.getenv('DB_PATH', 'metro_shop.db')

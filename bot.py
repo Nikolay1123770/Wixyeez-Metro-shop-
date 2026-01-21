@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Metro Shop Telegram Bot + WebApp Server - All-in-One
-Полностью рабочая версия с админ-панелью
+Единый файл для хостинга на bothost.ru
 """
 
 import os
@@ -1252,6 +1252,7 @@ async function checkout() {
     try {
         tg.sendData(JSON.stringify({ action: 'checkout', cart: cart }));
         closeCart();
+        tg.close();
     } catch (error) {
         tg.showAlert('Ошибка оформления заказа');
     } finally {
@@ -1318,9 +1319,9 @@ document.getElementById('searchInput')?.addEventListener('input', debounce(async
     }
 }, 300));
 
-function showCatalog() { setActiveNav(0); }
-function showFavorites() { setActiveNav(1); tg.showAlert('Избранное в разработке'); }
-function showProfile() { setActiveNav(3); tg.showAlert('Профиль в разработке'); }
+function showCatalog() { setActiveNav(0); document.querySelector('.main-content').style.display = 'block'; }
+function showFavorites() { setActiveNav(1); }
+function showProfile() { setActiveNav(3); }
 
 function setActiveNav(index) {
     document.querySelectorAll('.nav-item').forEach((item, i) => {
@@ -1329,7 +1330,6 @@ function setActiveNav(index) {
 }
 
 function escapeHtml(text) {
-    if (!text) return '';
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
@@ -1562,7 +1562,6 @@ from telegram import (
     WebAppInfo,
     InputMediaPhoto,
     Update,
-    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -1570,15 +1569,8 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    ConversationHandler,
     filters,
 )
-
-# Состояния диалогов
-ADD_PRODUCT_NAME, ADD_PRODUCT_PRICE, ADD_PRODUCT_CATEGORY, ADD_PRODUCT_PHOTO, ADD_PRODUCT_DESC = range(5)
-ADD_CATEGORY_NAME, ADD_CATEGORY_EMOJI = range(2)
-BROADCAST_MSG, BROADCAST_CONFIRM = range(2)
-ADD_PROMO_CODE, ADD_PROMO_VALUE, ADD_PROMO_TYPE = range(3)
 
 def get_main_menu(user_id: int = None) -> ReplyKeyboardMarkup:
     keyboard = [
@@ -1636,10 +1628,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                 f"🎉 По вашей ссылке зарегистрировался {user.first_name}!\n"
                                 f"Вы получите {int(REFERRAL_PERCENT*100)}% от его покупок."
                             )
-                        except:
-                            pass
-            except:
-                pass
+                        except: pass
+            except: pass
         
         db.execute('''
             INSERT INTO users (tg_id, username, first_name, last_name, registered_at, last_active, invited_by)
@@ -1909,105 +1899,2378 @@ async def cart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             InlineKeyboardButton("➕", callback_data=f"cart_plus:{item['product_id']}"),
             InlineKeyboardButton("🗑", callback_data=f"cart_remove:{item['product_id']}")
         ])
-
+    
     text += f"━━━━━━━━━━━━━━━\n💰 **Итого: {total}₽**"
-
+    
     if user_db['balance'] > 0:
         text += f"\n💎 Ваш баланс: {user_db['balance']}₽"
-
+    
     buttons.append([InlineKeyboardButton('🗑 Очистить корзину', callback_data='cart_clear')])
     buttons.append([InlineKeyboardButton(f'✅ Оформить заказ на {total}₽', callback_data='checkout')])
+    
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    user_db = db.fetchone('SELECT * FROM users WHERE tg_id=?', (user.id,))
+    
+    cart_items = db.fetchall('''
+        SELECT c.*, p.name, p.price, p.id as product_id
+        FROM cart c 
+        JOIN products p ON c.product_id = p.id 
+        WHERE c.user_id=?
+    ''', (user_db['id'],))
+    
+    if not cart_items:
+        await query.message.reply_text("Корзина пуста!")
+        return
+    
+    subtotal = sum(item['price'] * item['quantity'] for item in cart_items)
+    
+    discount = 0
+    promo_code = context.user_data.get('promo_code')
+    if promo_code:
+        promo = db.fetchone('SELECT * FROM promocodes WHERE code=? AND is_active=1', (promo_code,))
+        if promo:
+            if promo['type'] == 'percent':
+                discount = subtotal * (promo['value'] / 100)
+                if promo['max_discount']:
+                    discount = min(discount, promo['max_discount'])
+            else:
+                discount = promo['value']
+    
+    balance_use = min(user_db['balance'], subtotal - discount)
+    total = subtotal - discount - balance_use
+    
+    order_number = generate_order_number()
+    items_json = json.dumps([{
+        'product_id': item['product_id'],
+        'name': item['name'],
+        'price': item['price'],
+        'quantity': item['quantity']
+    } for item in cart_items])
+    
+    order_id = db.execute('''
+        INSERT INTO orders (order_number, user_id, items, subtotal, discount_amount, 
+                           balance_used, total, status, pubg_id, promo_code, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (order_number, user_db['id'], items_json, subtotal, discount, 
+          balance_use, total, 'awaiting_payment', user_db['pubg_id'], promo_code, now_iso()))
+    
+    if balance_use > 0:
+        db.execute('UPDATE users SET balance = balance - ? WHERE id=?', (balance_use, user_db['id']))
+    
+    db.execute('DELETE FROM cart WHERE user_id=?', (user_db['id'],))
+    
+    context.user_data['pending_order_id'] = order_id
+    context.user_data.pop('promo_code', None)
+    
+    text = f"📋 **Заказ #{order_number}**\n\n📦 Товары:\n"
+    for item in cart_items:
+        text += f"• {item['name']} × {item['quantity']} = {item['price'] * item['quantity']}₽\n"
+    
+    text += f"\n━━━━━━━━━━━━━━━\nПодытог: {subtotal}₽\n"
+    if discount > 0:
+        text += f"🏷 Скидка: -{discount}₽\n"
+    if balance_use > 0:
+        text += f"💎 Баланс: -{balance_use}₽\n"
+    text += f"\n💰 **К оплате: {total}₽**\n"
+    
+    if total > 0:
+        text += f"""
+━━━━━━━━━━━━━━━
+💳 **Реквизиты для оплаты:**
+
+**{PAYMENT_BANK}:** `{PAYMENT_CARD}`
+**Получатель:** {PAYMENT_HOLDER}
+
+📸 После оплаты отправьте скриншот сюда!
+"""
+        await query.message.reply_text(text, parse_mode='Markdown')
+    else:
+        db.execute('UPDATE orders SET status=?, paid_at=? WHERE id=?', ('paid', now_iso(), order_id))
+        await notify_admins_new_order(context, order_id)
+        text += "\n✅ **Заказ оплачен балансом!**\nОжидайте выполнения."
+        await query.message.reply_text(text, parse_mode='Markdown')
+
+async def profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_db = db.fetchone('SELECT * FROM users WHERE tg_id=?', (user.id,))
+    
+    if not user_db:
+        await update.message.reply_text("Напишите /start для регистрации")
+        return
+    
+    orders_count = db.fetchone('SELECT COUNT(*) as cnt FROM orders WHERE user_id=?', (user_db['id'],))['cnt']
+    total_spent_row = db.fetchone('SELECT SUM(total) as total FROM orders WHERE user_id=? AND status="completed"', (user_db['id'],))
+    total_spent = total_spent_row['total'] or 0 if total_spent_row else 0
+    
+    ref_link = f"https://t.me/{context.bot.username}?start=ref{user.id}"
+    
+    text = f"""
+👤 **Ваш профиль**
+
+🆔 ID: `{user.id}`
+📝 Имя: {user.first_name} {user.last_name or ''}
+📅 В сервисе с: {user_db['registered_at'][:10]}
+
+💰 **Баланс: {user_db['balance']}₽**
+📦 Заказов: {orders_count}
+💸 Потрачено: {total_spent}₽
+
+👥 **Реферальная программа:**
+Приглашено: {user_db['referrals_count']} друзей
+Ваша ссылка: `{ref_link}`
+
+_Приглашайте друзей и получайте {int(REFERRAL_PERCENT*100)}% от их покупок!_
+"""
+    
+    buttons = [
+        [InlineKeyboardButton('🎮 Изменить PUBG ID', callback_data='edit_pubg')],
+        [InlineKeyboardButton('📊 История баланса', callback_data='balance_history')],
+        [InlineKeyboardButton('🔗 Поделиться ссылкой', switch_inline_query=ref_link)]
+    ]
+    
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def favorites_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
+    
+    if not user_db:
+        await update.message.reply_text("Напишите /start для регистрации")
+        return
+    
+    favorites_list = db.fetchall('''
+        SELECT p.* FROM favorites f 
+        JOIN products p ON f.product_id = p.id 
+        WHERE f.user_id=? AND p.is_active=1
+        ORDER BY f.added_at DESC
+    ''', (user_db['id'],))
+    
+    if not favorites_list:
+        await update.message.reply_text(
+            "💝 **Избранное пусто**\n\nДобавляйте товары в избранное, нажимая ❤️",
+            parse_mode='Markdown'
+        )
+        return
+    
+    await update.message.reply_text(f"💝 **Избранное** ({len(favorites_list)} товаров):", parse_mode='Markdown')
+    
+    for product in favorites_list:
+        await send_product_card(update.message, product, context)
+
+async def toggle_favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    product_id = int(query.data.split(':')[1])
+    
+    user = query.from_user
+    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
+    
+    if not user_db:
+        await query.answer("Ошибка. Напишите /start", show_alert=True)
+        return
+    
+    existing = db.fetchone('SELECT id FROM favorites WHERE user_id=? AND product_id=?',
+                           (user_db['id'], product_id))
+    
+    if existing:
+        db.execute('DELETE FROM favorites WHERE id=?', (existing['id'],))
+        await query.answer("💔 Удалено из избранного")
+    else:
+        db.execute('INSERT INTO favorites (user_id, product_id, added_at) VALUES (?, ?, ?)',
+                   (user_db['id'], product_id, now_iso()))
+        await query.answer("❤️ Добавлено в избранное!")
+
+async def my_orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
+    
+    if not user_db:
+        await update.message.reply_text("Напишите /start для регистрации")
+        return
+    
+    orders = db.fetchall('SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 10', (user_db['id'],))
+    
+    if not orders:
+        await update.message.reply_text("📦 У вас пока нет заказов")
+        return
+    
+    status_emoji = {
+        'awaiting_payment': '⏳',
+        'pending': '🔄',
+        'paid': '✅',
+        'in_progress': '🔨',
+        'delivering': '📦',
+        'completed': '✅',
+        'cancelled': '❌'
+    }
+    
+    text = "📦 **Ваши заказы:**\n\n"
+    buttons = []
+    
+    for order in orders:
+        emoji = status_emoji.get(order['status'], '❓')
+        items = json.loads(order['items'])
+        items_text = ', '.join([i['name'] for i in items[:2]])
+        if len(items) > 2:
+            items_text += f" +{len(items)-2}"
+        
+        text += f"{emoji} **#{order['order_number']}**\n"
+        text += f"   {items_text}\n"
+        text += f"   💰 {order['total']}₽ • {order['created_at'][:10]}\n\n"
+        
+        buttons.append([InlineKeyboardButton(f"#{order['order_number']}", callback_data=f"order_detail:{order['id']}")])
+    
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
+    
+    if not user_db:
+        return
+    
+    pending_order = db.fetchone('''
+        SELECT * FROM orders 
+        WHERE user_id=? AND status='awaiting_payment' 
+        ORDER BY created_at DESC LIMIT 1
+    ''', (user_db['id'],))
+    
+    if not pending_order:
+        return
+    
+    file_id = update.message.photo[-1].file_id
+    
+    db.execute('UPDATE orders SET status=?, payment_screenshot=? WHERE id=?', 
+               ('pending', file_id, pending_order['id']))
+    
+    await update.message.reply_text(
+        "✅ **Скриншот получен!**\n\nОжидайте подтверждения оплаты администратором.",
+        parse_mode='Markdown',
+        reply_markup=get_main_menu(user.id)
+    )
+    
+    await notify_admins_new_order(context, pending_order['id'], file_id)
+
+async def notify_admins_new_order(context: ContextTypes.DEFAULT_TYPE, order_id: int, screenshot: str = None) -> None:
+    order = db.fetchone('SELECT * FROM orders WHERE id=?', (order_id,))
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (order['user_id'],))
+    
+    items = json.loads(order['items'])
+    items_text = '\n'.join([f"• {i['name']} × {i['quantity']} = {i['price'] * i['quantity']}₽" for i in items])
+    
+    text = f"""
+🆕 **Новый заказ #{order['order_number']}**
+
+👤 Покупатель: @{user['username'] or 'Нет username'} ({user['tg_id']})
+🎮 PUBG ID: {order['pubg_id'] or 'Не указан'}
+
+📦 **Товары:**
+{items_text}
+
+💰 Подытог: {order['subtotal']}₽
+"""
+    if order['discount_amount'] > 0:
+        text += f"🏷 Скидка: -{order['discount_amount']}₽\n"
+    if order['balance_used'] > 0:
+        text += f"💎 Баланс: -{order['balance_used']}₽\n"
+    text += f"\n**К оплате: {order['total']}₽**"
+    
+    buttons = [
+        [
+            InlineKeyboardButton('✅ Подтвердить', callback_data=f"admin_confirm:{order_id}"),
+            InlineKeyboardButton('❌ Отклонить', callback_data=f"admin_reject:{order_id}")
+        ],
+        [InlineKeyboardButton('📞 Связаться', url=f"tg://user?id={user['tg_id']}")]
+    ]
+    kb = InlineKeyboardMarkup(buttons)
+    
+    try:
+        if screenshot:
+            await context.bot.send_photo(ADMIN_CHAT_ID, screenshot, caption=text, parse_mode='Markdown', reply_markup=kb)
+        else:
+            await context.bot.send_message(ADMIN_CHAT_ID, text, parse_mode='Markdown', reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Failed to notify admins: {e}")
+
+async def admin_order_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    
+    action, order_id = query.data.split(':')
+    order_id = int(order_id)
+    
+    order = db.fetchone('SELECT * FROM orders WHERE id=?', (order_id,))
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (order['user_id'],))
+    
+    if action == 'admin_confirm':
+        db.execute('UPDATE orders SET status=?, paid_at=? WHERE id=?', ('paid', now_iso(), order_id))
+        
+        if user['invited_by'] and order['total'] > 0:
+            bonus = order['total'] * REFERRAL_PERCENT
+            db.execute('UPDATE users SET balance = balance + ? WHERE id=?', (bonus, user['invited_by']))
+            referrer = db.fetchone('SELECT tg_id FROM users WHERE id=?', (user['invited_by'],))
+            if referrer:
+                try:
+                    await context.bot.send_message(referrer['tg_id'], f"💰 Вам начислено +{bonus:.2f}₽ за покупку реферала!")
+                except: pass
+        
+        try:
+            await context.bot.send_message(user['tg_id'], f"✅ **Оплата подтверждена!**\n\nЗаказ #{order['order_number']} принят в работу.", parse_mode='Markdown')
+        except: pass
+        
+        try:
+            await query.message.edit_caption(
+                caption=query.message.caption + "\n\n✅ **ОПЛАТА ПОДТВЕРЖДЕНА**",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('🟢 Взять', callback_data=f"worker_take:{order_id}")],
+                    [
+                        InlineKeyboardButton('▶️ В работе', callback_data=f"status_progress:{order_id}"),
+                        InlineKeyboardButton('📦 Выдача', callback_data=f"status_deliver:{order_id}"),
+                        InlineKeyboardButton('✅ Готово', callback_data=f"status_done:{order_id}")
+                    ]
+                ])
+            )
+        except:
+            await query.message.edit_text(
+                text=query.message.text + "\n\n✅ **ОПЛАТА ПОДТВЕРЖДЕНА**",
+                parse_mode='Markdown'
+            )
+        
+    elif action == 'admin_reject':
+        if order['balance_used'] > 0:
+            db.execute('UPDATE users SET balance = balance + ? WHERE id=?', (order['balance_used'], user['id']))
+        
+        db.execute('UPDATE orders SET status=?, cancelled_at=?, cancel_reason=? WHERE id=?',
+                   ('cancelled', now_iso(), 'Payment rejected', order_id))
+        
+        try:
+            msg = f"❌ Заказ #{order['order_number']} отклонен."
+            if order['balance_used'] > 0:
+                msg += "\nБаланс возвращен."
+            await context.bot.send_message(user['tg_id'], msg)
+        except: pass
+        
+        try:
+            await query.message.edit_caption(
+                caption=query.message.caption + "\n\n❌ **ОТКЛОНЕНО**",
+                parse_mode='Markdown'
+            )
+        except:
+            await query.message.edit_text(
+                text=query.message.text + "\n\n❌ **ОТКЛОНЕНО**",
+                parse_mode='Markdown'
+            )
+
+async def leave_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Функция отзывов в разработке", show_alert=True)
+
+# ============== ADMIN PANEL FUNCTIONS ==============
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("У вас нет доступа к этой функции")
+        return
+
+    text = """
+⚙️ **Админ-панель**
+
+Выберите раздел для управления:
+"""
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=get_admin_keyboard())
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    # Основная статистика
+    users_count = db.fetchone('SELECT COUNT(*) as count FROM users')['count']
+    active_users = db.fetchone('SELECT COUNT(*) as count FROM users WHERE last_active >= ?',
+                              (datetime.utcnow() - timedelta(days=7)).isoformat())['count']
+
+    orders_count = db.fetchone('SELECT COUNT(*) as count FROM orders')['count']
+    completed_orders = db.fetchone('SELECT COUNT(*) as count FROM orders WHERE status="completed"')['count']
+    revenue = db.fetchone('SELECT SUM(total) as total FROM orders WHERE status="completed"')['total'] or 0
+
+    products_count = db.fetchone('SELECT COUNT(*) as count FROM products WHERE is_active=1')['count']
+    categories_count = db.fetchone('SELECT COUNT(*) as count FROM categories WHERE is_active=1')['count']
+
+    text = f"""
+📊 **Статистика сервиса**
+
+👥 **Пользователи:**
+• Всего: {users_count}
+• Активных (7 дней): {active_users}
+
+📦 **Заказы:**
+• Всего: {orders_count}
+• Завершено: {completed_orders}
+• Выручка: {revenue:.2f}₽
+
+🛍 **Товары:**
+• Всего товаров: {products_count}
+• Категорий: {categories_count}
+
+💰 **Финансы:**
+• Баланс системы: {revenue * (1 - WORKER_PERCENT):.2f}₽
+• На выплаты: {revenue * WORKER_PERCENT:.2f}₽
+"""
+
+    buttons = [
+        [InlineKeyboardButton('📈 Подробная аналитика', callback_data='detailed_stats')],
+        [InlineKeyboardButton('🔄 Обновить', callback_data='refresh_stats')]
+    ]
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    status_filter = context.user_data.get('order_status_filter', 'all')
+    page = context.user_data.get('order_page', 1)
+    per_page = 5
+
+    query = 'SELECT * FROM orders'
+    params = []
+
+    if status_filter != 'all':
+        query += ' WHERE status=?'
+        params.append(status_filter)
+
+    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
+    params.extend([per_page, (page-1)*per_page])
+
+    orders = db.fetchall(query, tuple(params))
+    total_orders = db.fetchone('SELECT COUNT(*) as count FROM orders' + (' WHERE status=?' if status_filter != 'all' else ''),
+                              (status_filter,) if status_filter != 'all' else ())['count']
+
+    if not orders:
+        await update.message.reply_text("Заказов не найдено")
+        return
+
+    status_emoji = {
+        'awaiting_payment': '⏳',
+        'pending': '🔄',
+        'paid': '✅',
+        'in_progress': '🔨',
+        'delivering': '📦',
+        'completed': '✅',
+        'cancelled': '❌'
+    }
+
+    text = f"📦 **Все заказы** (страница {page}/{max(1, (total_orders + per_page - 1) // per_page)})\n\n"
+    buttons = []
+
+    for order in orders:
+        emoji = status_emoji.get(order['status'], '❓')
+        user = db.fetchone('SELECT username, first_name FROM users WHERE id=?', (order['user_id'],))
+        username = user['username'] or user['first_name'] or 'Неизвестно'
+
+        items = json.loads(order['items'])
+        items_text = ', '.join([i['name'] for i in items[:2]])
+        if len(items) > 2:
+            items_text += f" +{len(items)-2}"
+
+        text += f"{emoji} **#{order['order_number']}** ({order['status']})\n"
+        text += f"   {username} | {order['total']}₽\n"
+        text += f"   {items_text}\n\n"
+
+        buttons.append([InlineKeyboardButton(f"#{order['order_number']}", callback_data=f"order_detail:{order['id']}")])
+
+    # Пагинация
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(InlineKeyboardButton('⬅️ Назад', callback_data=f"orders_page:{page-1}"))
+    if page * per_page < total_orders:
+        pagination_buttons.append(InlineKeyboardButton('Вперед ➡️', callback_data=f"orders_page:{page+1}"))
+
+    # Фильтры
+    status_buttons = []
+    for status in ['all', 'awaiting_payment', 'paid', 'in_progress', 'completed', 'cancelled']:
+        emoji = status_emoji.get(status, '❓')
+        status_buttons.append(InlineKeyboardButton(f"{emoji} {status.replace('_', ' ').title()}",
+                                                  callback_data=f"orders_filter:{status}"))
+
+    buttons.append(status_buttons)
+    if pagination_buttons:
+        buttons.append(pagination_buttons)
 
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
 
-
-# === Обработка нажатий на кнопки: ➕➖🗑 и Очистить ===
-async def cart_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    await query.answer()
-    user = query.from_user
-    user_db = db.fetchone('SELECT id FROM users WHERE tg_id=?', (user.id,))
-    if not user_db:
+async def admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
         return
 
-    if data.startswith("cart_minus:"):
-        product_id = int(data.split(":")[1])
-        item = db.fetchone('SELECT quantity FROM cart WHERE user_id=? AND product_id=?', (user_db['id'], product_id))
-        if item:
-            if item['quantity'] <= 1:
-                db.execute('DELETE FROM cart WHERE user_id=? AND product_id=?', (user_db['id'], product_id))
-            else:
-                db.execute('UPDATE cart SET quantity=quantity-1 WHERE user_id=? AND product_id=?', (user_db['id'], product_id))
-        await cart_handler(update, context)
+    page = context.user_data.get('products_page', 1)
+    per_page = 5
 
-    elif data.startswith("cart_plus:"):
-        product_id = int(data.split(":")[1])
-        db.execute('UPDATE cart SET quantity=quantity+1 WHERE user_id=? AND product_id=?', (user_db['id'], product_id))
-        await cart_handler(update, context)
+    products = db.fetchall('''
+        SELECT p.*, c.name as category_name
+        FROM products p
+        LEFT JOIN categories c ON p.category_id = c.id
+        ORDER BY p.is_featured DESC, p.sold_count DESC
+        LIMIT ? OFFSET ?
+    ''', (per_page, (page-1)*per_page))
 
-    elif data.startswith("cart_remove:"):
-        product_id = int(data.split(":")[1])
-        db.execute('DELETE FROM cart WHERE user_id=? AND product_id=?', (user_db['id'], product_id))
-        await cart_handler(update, context)
+    total_products = db.fetchone('SELECT COUNT(*) as count FROM products')['count']
 
-    elif data == "cart_clear":
-        db.execute('DELETE FROM cart WHERE user_id=?', (user_db['id'],))
-        await query.message.edit_text("🗑 Корзина очищена!")
+    if not products:
+        await update.message.reply_text("Товаров не найдено")
+        return
 
-    elif data == "noop":
-        pass  # ничего не делаем
+    text = f"📦 **Все товары** (страница {page}/{max(1, (total_products + per_page - 1) // per_page)})\n\n"
+    buttons = []
 
+    for product in products:
+        status = "✅" if product['is_active'] else "❌"
+        featured = "🔥" if product['is_featured'] else ""
+        text += f"{status} {featured} **{product['name']}**\n"
+        text += f"   Категория: {product['category_name'] or 'Без категории'}\n"
+        text += f"   Цена: {product['price']}₽ | Продано: {product['sold_count']}\n\n"
 
-# === Хендлер на callback "checkout" (оформление заказа) ===
-async def checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        buttons.append([
+            InlineKeyboardButton('✏️ Редактировать', callback_data=f"edit_product:{product['id']}"),
+            InlineKeyboardButton('🗑 Удалить', callback_data=f"delete_product:{product['id']}")
+        ])
+
+    # Пагинация
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(InlineKeyboardButton('⬅️ Назад', callback_data=f"products_page:{page-1}"))
+    if page * per_page < total_products:
+        pagination_buttons.append(InlineKeyboardButton('Вперед ➡️', callback_data=f"products_page:{page+1}"))
+
+    buttons.append([InlineKeyboardButton('➕ Добавить товар', callback_data='add_product')])
+    if pagination_buttons:
+        buttons.append(pagination_buttons)
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def add_product_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    context.user_data['adding_product'] = True
+    context.user_data['product_data'] = {
+        'name': '',
+        'category_id': None,
+        'price': 0,
+        'old_price': 0,
+        'description': '',
+        'short_description': '',
+        'photo': '',
+        'stock': -1,
+        'is_featured': False
+    }
+
+    categories = db.fetchall('SELECT * FROM categories WHERE is_active=1 ORDER BY sort_order')
+    buttons = [[InlineKeyboardButton(cat['name'], callback_data=f"set_category:{cat['id']}")] for cat in categories]
+    buttons.append([InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_product')])
+
+    await update.message.reply_text(
+        "📝 **Добавление нового товара**\n\nВыберите категорию:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def set_product_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("✅ Для оформления заказа перейдите в WebApp и нажмите «Оформить заказ» внутри корзины.", reply_markup=get_main_menu(query.from_user.id))
 
+    category_id = int(query.data.split(':')[1])
+    category = db.fetchone('SELECT * FROM categories WHERE id=?', (category_id,))
 
-# === РЕГИСТРАЦИЯ ВСЕХ ХЕНДЛЕРОВ В ПРИЛОЖЕНИИ ===
+    context.user_data['product_data']['category_id'] = category_id
+
+    await query.message.edit_text(
+        f"📝 **Добавление товара**\n\nКатегория: {category['name']}\n\nВведите название товара:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_product')]])
+    )
+
+async def product_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_product'):
+        return
+
+    context.user_data['product_data']['name'] = update.message.text
+
+    await update.message.reply_text(
+        "Введите цену товара (в рублях):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_product')]])
+    )
+
+async def product_price_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_product'):
+        return
+
+    try:
+        price = float(update.message.text)
+        context.user_data['product_data']['price'] = price
+
+        await update.message.reply_text(
+            "Введите старую цену (если есть скидка, иначе 0):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_product')]])
+        )
+    except ValueError:
+        await update.message.reply_text("Некорректная цена. Введите число.")
+
+async def product_old_price_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_product'):
+        return
+
+    try:
+        old_price = float(update.message.text)
+        context.user_data['product_data']['old_price'] = old_price
+
+        await update.message.reply_text(
+            "Введите краткое описание (для карточки товара):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_product')]])
+        )
+    except ValueError:
+        await update.message.reply_text("Некорректная цена. Введите число.")
+
+async def product_short_desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_product'):
+        return
+
+    context.user_data['product_data']['short_description'] = update.message.text
+
+    await update.message.reply_text(
+        "Введите полное описание товара:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_product')]])
+    )
+
+async def product_desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_product'):
+        return
+
+    context.user_data['product_data']['description'] = update.message.text
+
+    await update.message.reply_text(
+        "Отправьте фото товара (или нажмите 'Пропустить'):",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('📎 Пропустить', callback_data='skip_photo')],
+            [InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_product')]
+        ])
+    )
+
+async def product_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_product'):
+        return
+
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        context.user_data['product_data']['photo'] = file_id
+
+    await confirm_product_creation(update, context)
+
+async def skip_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    await confirm_product_creation(update, context)
+
+async def confirm_product_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.user_data['product_data']
+
+    text = f"""
+📝 **Подтверждение добавления товара**
+
+Название: {data['name']}
+Категория: {db.fetchone('SELECT name FROM categories WHERE id=?', (data['category_id'],))['name']}
+Цена: {data['price']}₽
+Старая цена: {data['old_price'] or 'Нет'}₽
+Краткое описание: {data['short_description'] or 'Нет'}
+Описание: {data['description'] or 'Нет'}
+Фото: {'Есть' if data['photo'] else 'Нет'}
+"""
+
+    buttons = [
+        [InlineKeyboardButton('✅ Добавить', callback_data='confirm_add_product')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_product')]
+    ]
+
+    if isinstance(update, Update) and update.callback_query:
+        await update.callback_query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+    else:
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def confirm_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data['product_data']
+
+    product_id = db.execute('''
+        INSERT INTO products (category_id, name, short_description, description, price, old_price,
+                             photo, stock, is_active, is_featured, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    ''', (
+        data['category_id'],
+        data['name'],
+        data['short_description'],
+        data['description'],
+        data['price'],
+        data['old_price'] if data['old_price'] > 0 else None,
+        data['photo'],
+        data['stock'],
+        data['is_featured'],
+        now_iso(),
+        now_iso()
+    ))
+
+    context.user_data.pop('adding_product', None)
+    context.user_data.pop('product_data', None)
+
+    await query.message.edit_text(f"✅ Товар успешно добавлен! ID: {product_id}")
+
+async def edit_product_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    product_id = int(query.data.split(':')[1])
+
+    product = db.fetchone('SELECT * FROM products WHERE id=?', (product_id,))
+    if not product:
+        await query.answer("Товар не найден", show_alert=True)
+        return
+
+    context.user_data['editing_product'] = product_id
+    context.user_data['product_data'] = {
+        'name': product['name'],
+        'category_id': product['category_id'],
+        'price': product['price'],
+        'old_price': product['old_price'] or 0,
+        'description': product['description'],
+        'short_description': product['short_description'],
+        'photo': product['photo'],
+        'stock': product['stock'],
+        'is_featured': bool(product['is_featured']),
+        'is_active': bool(product['is_active'])
+    }
+
+    categories = db.fetchall('SELECT * FROM categories WHERE is_active=1 ORDER BY sort_order')
+    buttons = [[InlineKeyboardButton(cat['name'], callback_data=f"edit_set_category:{cat['id']}")] for cat in categories]
+    buttons.append([InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')])
+
+    await query.message.edit_text(
+        f"📝 **Редактирование товара #{product_id}**\n\nТекущая категория: {db.fetchone('SELECT name FROM categories WHERE id=?', (product['category_id'],))['name']}\n\nВыберите новую категорию (или оставьте текущую):",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def edit_set_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    category_id = int(query.data.split(':')[1])
+    context.user_data['product_data']['category_id'] = category_id
+
+    data = context.user_data['product_data']
+
+    text = f"""
+📝 **Редактирование товара**
+
+Текущие значения:
+Название: {data['name']}
+Категория: {db.fetchone('SELECT name FROM categories WHERE id=?', (data['category_id'],))['name']}
+Цена: {data['price']}₽
+Старая цена: {data['old_price'] or 'Нет'}₽
+Краткое описание: {data['short_description'] or 'Нет'}
+Описание: {data['description'] or 'Нет'}
+Фото: {'Есть' if data['photo'] else 'Нет'}
+В наличии: {'Да' if data['stock'] != 0 else 'Нет'}
+Рекомендуемый: {'Да' if data['is_featured'] else 'Нет'}
+Активен: {'Да' if data['is_active'] else 'Нет'}
+
+Выберите поле для редактирования:
+"""
+
+    buttons = [
+        [InlineKeyboardButton('📛 Название', callback_data='edit_name')],
+        [InlineKeyboardButton('💰 Цена', callback_data='edit_price')],
+        [InlineKeyboardButton('🏷 Старая цена', callback_data='edit_old_price')],
+        [InlineKeyboardButton('✏️ Краткое описание', callback_data='edit_short_desc')],
+        [InlineKeyboardButton('📝 Полное описание', callback_data='edit_desc')],
+        [InlineKeyboardButton('📷 Фото', callback_data='edit_photo')],
+        [InlineKeyboardButton('📦 Наличие', callback_data='edit_stock')],
+        [InlineKeyboardButton('🔥 Рекомендуемый', callback_data='edit_featured')],
+        [InlineKeyboardButton('✅ Активность', callback_data='edit_active')],
+        [InlineKeyboardButton('✅ Сохранить', callback_data='save_product')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')]
+    ]
+
+    await query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def edit_product_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    field = query.data.split('_')[1]
+    data = context.user_data['product_data']
+
+    if field == 'name':
+        await query.message.edit_text(
+            f"Текущее название: {data['name']}\n\nВведите новое название:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')]])
+        )
+        context.user_data['editing_field'] = 'name'
+    elif field == 'price':
+        await query.message.edit_text(
+            f"Текущая цена: {data['price']}₽\n\nВведите новую цену:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')]])
+        )
+        context.user_data['editing_field'] = 'price'
+    elif field == 'old_price':
+        await query.message.edit_text(
+            f"Текущая старая цена: {data['old_price'] or 0}₽\n\nВведите новую старую цену (или 0 для удаления):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')]])
+        )
+        context.user_data['editing_field'] = 'old_price'
+    elif field == 'short_desc':
+        await query.message.edit_text(
+            f"Текущее краткое описание: {data['short_description'] or 'Нет'}\n\nВведите новое краткое описание:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')]])
+        )
+        context.user_data['editing_field'] = 'short_description'
+    elif field == 'desc':
+        await query.message.edit_text(
+            f"Текущее описание: {data['description'] or 'Нет'}\n\nВведите новое описание:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')]])
+        )
+        context.user_data['editing_field'] = 'description'
+    elif field == 'photo':
+        await query.message.edit_text(
+            "Отправьте новое фото товара (или нажмите 'Удалить'):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('🗑 Удалить фото', callback_data='delete_photo')],
+                [InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')]
+            ])
+        )
+        context.user_data['editing_field'] = 'photo'
+    elif field == 'stock':
+        await query.message.edit_text(
+            f"Текущее количество: {'Неограничено' if data['stock'] == -1 else data['stock']}\n\nВведите новое количество (или -1 для неограниченного):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_product')]])
+        )
+        context.user_data['editing_field'] = 'stock'
+    elif field == 'featured':
+        data['is_featured'] = not data['is_featured']
+        await edit_product_handler(update, context)
+    elif field == 'active':
+        data['is_active'] = not data['is_active']
+        await edit_product_handler(update, context)
+
+async def save_product_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    product_id = context.user_data['editing_product']
+    data = context.user_data['product_data']
+
+    db.execute('''
+        UPDATE products SET
+            category_id=?,
+            name=?,
+            short_description=?,
+            description=?,
+            price=?,
+            old_price=?,
+            photo=?,
+            stock=?,
+            is_featured=?,
+            is_active=?,
+            updated_at=?
+        WHERE id=?
+    ''', (
+        data['category_id'],
+        data['name'],
+        data['short_description'],
+        data['description'],
+        data['price'],
+        data['old_price'] if data['old_price'] > 0 else None,
+        data['photo'],
+        data['stock'],
+        data['is_featured'],
+        data['is_active'],
+        now_iso(),
+        product_id
+    ))
+
+    context.user_data.pop('editing_product', None)
+    context.user_data.pop('product_data', None)
+
+    await query.message.edit_text(f"✅ Товар #{product_id} успешно обновлен!")
+
+async def delete_product_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    product_id = int(query.data.split(':')[1])
+
+    product = db.fetchone('SELECT * FROM products WHERE id=?', (product_id,))
+    if not product:
+        await query.answer("Товар не найден", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton('✅ Да, удалить', callback_data=f"confirm_delete:{product_id}")],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_delete')]
+    ]
+
+    await query.message.edit_text(
+        f"⚠️ Вы уверены, что хотите удалить товар **{product['name']}**?\n\nЭто действие нельзя отменить!",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def confirm_delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    product_id = int(query.data.split(':')[1])
+
+    db.execute('DELETE FROM products WHERE id=?', (product_id,))
+
+    await query.message.edit_text(f"✅ Товар #{product_id} успешно удален!")
+
+async def admin_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    categories = db.fetchall('SELECT * FROM categories ORDER BY sort_order')
+
+    if not categories:
+        await update.message.reply_text("Категорий не найдено")
+        return
+
+    text = "📁 **Категории товаров**\n\n"
+    buttons = []
+
+    for cat in categories:
+        status = "✅" if cat['is_active'] else "❌"
+        text += f"{status} **{cat['name']}** {cat['emoji'] or ''}\n"
+        text += f"   Описание: {cat['description'] or 'Нет'}\n"
+        text += f"   Сортировка: {cat['sort_order']}\n\n"
+
+        buttons.append([
+            InlineKeyboardButton('✏️ Редактировать', callback_data=f"edit_category:{cat['id']}"),
+            InlineKeyboardButton('🗑 Удалить', callback_data=f"delete_category:{cat['id']}")
+        ])
+
+    buttons.append([InlineKeyboardButton('➕ Добавить категорию', callback_data='add_category')])
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def add_category_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['adding_category'] = True
+    context.user_data['category_data'] = {
+        'name': '',
+        'emoji': '📦',
+        'description': '',
+        'sort_order': 0
+    }
+
+    await query.message.edit_text(
+        "📝 **Добавление новой категории**\n\nВведите название категории:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_category')]])
+    )
+
+async def category_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_category'):
+        return
+
+    context.user_data['category_data']['name'] = update.message.text
+
+    await update.message.reply_text(
+        "Введите эмодзи для категории (например, 📦):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_category')]])
+    )
+
+async def category_emoji_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_category'):
+        return
+
+    context.user_data['category_data']['emoji'] = update.message.text
+
+    await update.message.reply_text(
+        "Введите описание категории:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_category')]])
+    )
+
+async def category_desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_category'):
+        return
+
+    context.user_data['category_data']['description'] = update.message.text
+
+    await update.message.reply_text(
+        "Введите порядок сортировки (число, чем меньше - тем выше):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_category')]])
+    )
+
+async def category_sort_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_category'):
+        return
+
+    try:
+        sort_order = int(update.message.text)
+        context.user_data['category_data']['sort_order'] = sort_order
+
+        await confirm_category_creation(update, context)
+    except ValueError:
+        await update.message.reply_text("Некорректное число. Введите целое число.")
+
+async def confirm_category_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.user_data['category_data']
+
+    text = f"""
+📝 **Подтверждение добавления категории**
+
+Название: {data['name']}
+Эмодзи: {data['emoji']}
+Описание: {data['description'] or 'Нет'}
+Порядок сортировки: {data['sort_order']}
+"""
+
+    buttons = [
+        [InlineKeyboardButton('✅ Добавить', callback_data='confirm_add_category')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_category')]
+    ]
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def confirm_add_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data['category_data']
+
+    category_id = db.execute('''
+        INSERT INTO categories (name, emoji, description, sort_order, is_active, created_at)
+        VALUES (?, ?, ?, ?, 1, ?)
+    ''', (data['name'], data['emoji'], data['description'], data['sort_order'], now_iso()))
+
+    context.user_data.pop('adding_category', None)
+    context.user_data.pop('category_data', None)
+
+    await query.message.edit_text(f"✅ Категория успешно добавлена! ID: {category_id}")
+
+async def edit_category_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    category_id = int(query.data.split(':')[1])
+
+    category = db.fetchone('SELECT * FROM categories WHERE id=?', (category_id,))
+    if not category:
+        await query.answer("Категория не найдена", show_alert=True)
+        return
+
+    context.user_data['editing_category'] = category_id
+    context.user_data['category_data'] = {
+        'name': category['name'],
+        'emoji': category['emoji'] or '📦',
+        'description': category['description'],
+        'sort_order': category['sort_order'],
+        'is_active': bool(category['is_active'])
+    }
+
+    text = f"""
+📝 **Редактирование категории #{category_id}**
+
+Текущие значения:
+Название: {category['name']}
+Эмодзи: {category['emoji'] or 'Нет'}
+Описание: {category['description'] or 'Нет'}
+Порядок сортировки: {category['sort_order']}
+Активна: {'Да' if category['is_active'] else 'Нет'}
+
+Выберите поле для редактирования:
+"""
+
+    buttons = [
+        [InlineKeyboardButton('📛 Название', callback_data='edit_cat_name')],
+        [InlineKeyboardButton('😊 Эмодзи', callback_data='edit_cat_emoji')],
+        [InlineKeyboardButton('✏️ Описание', callback_data='edit_cat_desc')],
+        [InlineKeyboardButton('🔢 Порядок', callback_data='edit_cat_sort')],
+        [InlineKeyboardButton('✅ Активность', callback_data='edit_cat_active')],
+        [InlineKeyboardButton('✅ Сохранить', callback_data='save_category')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_category')]
+    ]
+
+    await query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def edit_category_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    field = query.data.split('_')[2]
+    data = context.user_data['category_data']
+
+    if field == 'name':
+        await query.message.edit_text(
+            f"Текущее название: {data['name']}\n\nВведите новое название:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_category')]])
+        )
+        context.user_data['editing_field'] = 'name'
+    elif field == 'emoji':
+        await query.message.edit_text(
+            f"Текущий эмодзи: {data['emoji']}\n\nВведите новый эмодзи:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_category')]])
+        )
+        context.user_data['editing_field'] = 'emoji'
+    elif field == 'desc':
+        await query.message.edit_text(
+            f"Текущее описание: {data['description'] or 'Нет'}\n\nВведите новое описание:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_category')]])
+        )
+        context.user_data['editing_field'] = 'description'
+    elif field == 'sort':
+        await query.message.edit_text(
+            f"Текущий порядок: {data['sort_order']}\n\nВведите новый порядок сортировки:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_category')]])
+        )
+        context.user_data['editing_field'] = 'sort_order'
+    elif field == 'active':
+        data['is_active'] = not data['is_active']
+        await edit_category_handler(update, context)
+
+async def save_category_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    category_id = context.user_data['editing_category']
+    data = context.user_data['category_data']
+
+    db.execute('''
+        UPDATE categories SET
+            name=?,
+            emoji=?,
+            description=?,
+            sort_order=?,
+            is_active=?
+        WHERE id=?
+    ''', (data['name'], data['emoji'], data['description'], data['sort_order'], data['is_active'], category_id))
+
+    context.user_data.pop('editing_category', None)
+    context.user_data.pop('category_data', None)
+
+    await query.message.edit_text(f"✅ Категория #{category_id} успешно обновлена!")
+
+async def delete_category_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    category_id = int(query.data.split(':')[1])
+
+    category = db.fetchone('SELECT * FROM categories WHERE id=?', (category_id,))
+    if not category:
+        await query.answer("Категория не найдена", show_alert=True)
+        return
+
+    # Проверяем, есть ли товары в этой категории
+    products_count = db.fetchone('SELECT COUNT(*) as count FROM products WHERE category_id=?', (category_id,))['count']
+
+    if products_count > 0:
+        await query.answer(f"Нельзя удалить категорию с {products_count} товарами", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton('✅ Да, удалить', callback_data=f"confirm_delete_category:{category_id}")],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_delete_category')]
+    ]
+
+    await query.message.edit_text(
+        f"⚠️ Вы уверены, что хотите удалить категорию **{category['name']}**?\n\nЭто действие нельзя отменить!",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def confirm_delete_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    category_id = int(query.data.split(':')[1])
+
+    db.execute('DELETE FROM categories WHERE id=?', (category_id,))
+
+    await query.message.edit_text(f"✅ Категория #{category_id} успешно удалена!")
+
+async def admin_promocodes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    promocodes = db.fetchall('SELECT * FROM promocodes ORDER BY created_at DESC')
+
+    if not promocodes:
+        await update.message.reply_text(
+            "🏷 **Промокоды**\n\nПромокодов не найдено",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('➕ Добавить промокод', callback_data='add_promocode')]])
+        )
+        return
+
+    text = "🏷 **Промокоды**\n\n"
+    buttons = []
+
+    for promo in promocodes:
+        status = "✅" if promo['is_active'] else "❌"
+        promo_type = "Процент" if promo['type'] == 'percent' else "Фиксированная сумма"
+        text += f"{status} **{promo['code']}**\n"
+        text += f"   Тип: {promo_type} | Значение: {promo['value']}{'%' if promo['type'] == 'percent' else '₽'}\n"
+        text += f"   Использований: {promo['uses_count']}/{promo['uses_total'] if promo['uses_total'] > 0 else '∞'}\n"
+        text += f"   Срок: {promo['valid_from'][:10]} - {promo['valid_until'][:10] if promo['valid_until'] else '∞'}\n\n"
+
+        buttons.append([
+            InlineKeyboardButton('✏️ Редактировать', callback_data=f"edit_promocode:{promo['id']}"),
+            InlineKeyboardButton('🗑 Удалить', callback_data=f"delete_promocode:{promo['id']}")
+        ])
+
+    buttons.append([InlineKeyboardButton('➕ Добавить промокод', callback_data='add_promocode')])
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def add_promocode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['adding_promocode'] = True
+    context.user_data['promocode_data'] = {
+        'code': '',
+        'type': 'percent',
+        'value': 10,
+        'min_order': 0,
+        'max_discount': 0,
+        'uses_total': -1,
+        'uses_per_user': 1,
+        'valid_from': datetime.utcnow().isoformat(),
+        'valid_until': (datetime.utcnow() + timedelta(days=30)).isoformat()
+    }
+
+    buttons = [
+        [InlineKeyboardButton('Процент', callback_data='promo_type:percent')],
+        [InlineKeyboardButton('Фиксированная сумма', callback_data='promo_type:fixed')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]
+    ]
+
+    await query.message.edit_text(
+        "📝 **Добавление промокода**\n\nВыберите тип промокода:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def promocode_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    promo_type = query.data.split(':')[1]
+
+    context.user_data['promocode_data']['type'] = promo_type
+
+    await query.message.edit_text(
+        f"Введите код промокода (например, SUMMER20):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]])
+    )
+
+async def promocode_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_promocode'):
+        return
+
+    code = update.message.text.upper()
+    existing = db.fetchone('SELECT 1 FROM promocodes WHERE code=?', (code,))
+
+    if existing:
+        await update.message.reply_text("Промокод с таким кодом уже существует. Введите другой код:")
+        return
+
+    context.user_data['promocode_data']['code'] = code
+
+    data = context.user_data['promocode_data']
+    await update.message.reply_text(
+        f"Введите значение промокода ({'%' if data['type'] == 'percent' else '₽'}):",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]])
+    )
+
+async def promocode_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_promocode'):
+        return
+
+    try:
+        value = float(update.message.text)
+        context.user_data['promocode_data']['value'] = value
+
+        await update.message.reply_text(
+            "Введите минимальную сумму заказа для применения промокода (0 - без ограничений):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]])
+        )
+    except ValueError:
+        await update.message.reply_text("Некорректное значение. Введите число.")
+
+async def promocode_min_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_promocode'):
+        return
+
+    try:
+        min_order = float(update.message.text)
+        context.user_data['promocode_data']['min_order'] = min_order
+
+        data = context.user_data['promocode_data']
+        if data['type'] == 'percent':
+            await update.message.reply_text(
+                "Введите максимальную сумму скидки (0 - без ограничений):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]])
+            )
+        else:
+            await update.message.reply_text(
+                "Введите максимальное количество использований промокода (-1 - без ограничений):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]])
+            )
+    except ValueError:
+        await update.message.reply_text("Некорректное значение. Введите число.")
+
+async def promocode_max_discount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_promocode'):
+        return
+
+    try:
+        max_discount = float(update.message.text)
+        context.user_data['promocode_data']['max_discount'] = max_discount
+
+        await update.message.reply_text(
+            "Введите максимальное количество использований промокода (-1 - без ограничений):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]])
+        )
+    except ValueError:
+        await update.message.reply_text("Некорректное значение. Введите число.")
+
+async def promocode_uses_total_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_promocode'):
+        return
+
+    try:
+        uses_total = int(update.message.text)
+        context.user_data['promocode_data']['uses_total'] = uses_total
+
+        await update.message.reply_text(
+            "Введите максимальное количество использований промокода на одного пользователя:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]])
+        )
+    except ValueError:
+        await update.message.reply_text("Некорректное значение. Введите целое число.")
+
+async def promocode_uses_per_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('adding_promocode'):
+        return
+
+    try:
+        uses_per_user = int(update.message.text)
+        context.user_data['promocode_data']['uses_per_user'] = uses_per_user
+
+        await confirm_promocode_creation(update, context)
+    except ValueError:
+        await update.message.reply_text("Некорректное значение. Введите целое число.")
+
+async def confirm_promocode_creation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.user_data['promocode_data']
+
+    text = f"""
+📝 **Подтверждение добавления промокода**
+
+Код: `{data['code']}`
+Тип: {'Процент' if data['type'] == 'percent' else 'Фиксированная сумма'}
+Значение: {data['value']}{'%' if data['type'] == 'percent' else '₽'}
+Минимальный заказ: {data['min_order']}₽
+Макс. скидка: {data['max_discount'] or 'Нет ограничений'}₽
+Использований всего: {data['uses_total'] if data['uses_total'] > 0 else '∞'}
+Использований на пользователя: {data['uses_per_user']}
+Срок действия: {data['valid_from'][:10]} - {data['valid_until'][:10]}
+"""
+
+    buttons = [
+        [InlineKeyboardButton('✅ Добавить', callback_data='confirm_add_promocode')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_promocode')]
+    ]
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def confirm_add_promocode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data['promocode_data']
+
+    promo_id = db.execute('''
+        INSERT INTO promocodes (code, type, value, min_order, max_discount, uses_total,
+                               uses_per_user, valid_from, valid_until, is_active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    ''', (
+        data['code'],
+        data['type'],
+        data['value'],
+        data['min_order'],
+        data['max_discount'] if data['max_discount'] > 0 else None,
+        data['uses_total'],
+        data['uses_per_user'],
+        data['valid_from'],
+        data['valid_until'],
+        now_iso()
+    ))
+
+    context.user_data.pop('adding_promocode', None)
+    context.user_data.pop('promocode_data', None)
+
+    await query.message.edit_text(f"✅ Промокод успешно добавлен! ID: {promo_id}")
+
+async def edit_promocode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    promo_id = int(query.data.split(':')[1])
+
+    promo = db.fetchone('SELECT * FROM promocodes WHERE id=?', (promo_id,))
+    if not promo:
+        await query.answer("Промокод не найден", show_alert=True)
+        return
+
+    context.user_data['editing_promocode'] = promo_id
+    context.user_data['promocode_data'] = {
+        'code': promo['code'],
+        'type': promo['type'],
+        'value': promo['value'],
+        'min_order': promo['min_order'],
+        'max_discount': promo['max_discount'] or 0,
+        'uses_total': promo['uses_total'],
+        'uses_per_user': promo['uses_per_user'],
+        'valid_from': promo['valid_from'],
+        'valid_until': promo['valid_until'],
+        'is_active': bool(promo['is_active'])
+    }
+
+    text = f"""
+📝 **Редактирование промокода #{promo_id}**
+
+Текущие значения:
+Код: {promo['code']}
+Тип: {'Процент' if promo['type'] == 'percent' else 'Фиксированная сумма'}
+Значение: {promo['value']}{'%' if promo['type'] == 'percent' else '₽'}
+Минимальный заказ: {promo['min_order']}₽
+Макс. скидка: {promo['max_discount'] or 'Нет ограничений'}₽
+Использований всего: {promo['uses_total'] if promo['uses_total'] > 0 else '∞'}
+Использований на пользователя: {promo['uses_per_user']}
+Срок действия: {promo['valid_from'][:10]} - {promo['valid_until'][:10] if promo['valid_until'] else '∞'}
+Активен: {'Да' if promo['is_active'] else 'Нет'}
+
+Выберите поле для редактирования:
+"""
+
+    buttons = [
+        [InlineKeyboardButton('📛 Код', callback_data='edit_promo_code')],
+        [InlineKeyboardButton('🔄 Тип', callback_data='edit_promo_type')],
+        [InlineKeyboardButton('💰 Значение', callback_data='edit_promo_value')],
+        [InlineKeyboardButton('📉 Мин. заказ', callback_data='edit_promo_min_order')],
+        [InlineKeyboardButton('🏷 Макс. скидка', callback_data='edit_promo_max_discount')],
+        [InlineKeyboardButton('🔢 Использований всего', callback_data='edit_promo_uses_total')],
+        [InlineKeyboardButton('👥 Использований на пользователя', callback_data='edit_promo_uses_per_user')],
+        [InlineKeyboardButton('📅 Срок действия', callback_data='edit_promo_dates')],
+        [InlineKeyboardButton('✅ Активность', callback_data='edit_promo_active')],
+        [InlineKeyboardButton('✅ Сохранить', callback_data='save_promocode')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]
+    ]
+
+    await query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def edit_promocode_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    field = query.data.split('_')[2]
+    data = context.user_data['promocode_data']
+
+    if field == 'code':
+        await query.message.edit_text(
+            f"Текущий код: {data['code']}\n\nВведите новый код:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]])
+        )
+        context.user_data['editing_field'] = 'code'
+    elif field == 'type':
+        buttons = [
+            [InlineKeyboardButton('Процент', callback_data='set_promo_type:percent')],
+            [InlineKeyboardButton('Фиксированная сумма', callback_data='set_promo_type:fixed')],
+            [InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]
+        ]
+        await query.message.edit_text(
+            "Выберите новый тип промокода:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    elif field == 'value':
+        await query.message.edit_text(
+            f"Текущее значение: {data['value']}{'%' if data['type'] == 'percent' else '₽'}\n\nВведите новое значение:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]])
+        )
+        context.user_data['editing_field'] = 'value'
+    elif field == 'min_order':
+        await query.message.edit_text(
+            f"Текущий минимальный заказ: {data['min_order']}₽\n\nВведите новое значение:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]])
+        )
+        context.user_data['editing_field'] = 'min_order'
+    elif field == 'max_discount':
+        await query.message.edit_text(
+            f"Текущая максимальная скидка: {data['max_discount'] or 'Нет ограничений'}₽\n\nВведите новое значение (0 - без ограничений):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]])
+        )
+        context.user_data['editing_field'] = 'max_discount'
+    elif field == 'uses_total':
+        await query.message.edit_text(
+            f"Текущее количество использований всего: {data['uses_total'] if data['uses_total'] > 0 else '∞'}\n\nВведите новое значение (-1 - без ограничений):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]])
+        )
+        context.user_data['editing_field'] = 'uses_total'
+    elif field == 'uses_per_user':
+        await query.message.edit_text(
+            f"Текущее количество использований на пользователя: {data['uses_per_user']}\n\nВведите новое значение:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]])
+        )
+        context.user_data['editing_field'] = 'uses_per_user'
+    elif field == 'dates':
+        await query.message.edit_text(
+            f"Текущий срок действия: {data['valid_from'][:10]} - {data['valid_until'][:10] if data['valid_until'] else '∞'}\n\nВведите новую дату окончания (YYYY-MM-DD или оставьте пустым для бессрочного):",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_edit_promocode')]])
+        )
+        context.user_data['editing_field'] = 'valid_until'
+    elif field == 'active':
+        data['is_active'] = not data['is_active']
+        await edit_promocode_handler(update, context)
+
+async def set_promo_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    promo_type = query.data.split(':')[1]
+
+    context.user_data['promocode_data']['type'] = promo_type
+    await edit_promocode_handler(update, context)
+
+async def save_promocode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    promo_id = context.user_data['editing_promocode']
+    data = context.user_data['promocode_data']
+
+    db.execute('''
+        UPDATE promocodes SET
+            code=?,
+            type=?,
+            value=?,
+            min_order=?,
+            max_discount=?,
+            uses_total=?,
+            uses_per_user=?,
+            valid_from=?,
+            valid_until=?,
+            is_active=?
+        WHERE id=?
+    ''', (
+        data['code'],
+        data['type'],
+        data['value'],
+        data['min_order'],
+        data['max_discount'] if data['max_discount'] > 0 else None,
+        data['uses_total'],
+        data['uses_per_user'],
+        data['valid_from'],
+        data['valid_until'],
+        data['is_active'],
+        promo_id
+    ))
+
+    context.user_data.pop('editing_promocode', None)
+    context.user_data.pop('promocode_data', None)
+
+    await query.message.edit_text(f"✅ Промокод #{promo_id} успешно обновлен!")
+
+async def delete_promocode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    promo_id = int(query.data.split(':')[1])
+
+    promo = db.fetchone('SELECT * FROM promocodes WHERE id=?', (promo_id,))
+    if not promo:
+        await query.answer("Промокод не найден", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton('✅ Да, удалить', callback_data=f"confirm_delete_promocode:{promo_id}")],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_delete_promocode')]
+    ]
+
+    await query.message.edit_text(
+        f"⚠️ Вы уверены, что хотите удалить промокод **{promo['code']}**?\n\nЭто действие нельзя отменить!",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def confirm_delete_promocode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    promo_id = int(query.data.split(':')[1])
+
+    db.execute('DELETE FROM promocodes WHERE id=?', (promo_id,))
+
+    await query.message.edit_text(f"✅ Промокод #{promo_id} успешно удален!")
+
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    page = context.user_data.get('users_page', 1)
+    per_page = 5
+
+    users = db.fetchall('''
+        SELECT * FROM users
+        ORDER BY last_active DESC
+        LIMIT ? OFFSET ?
+    ''', (per_page, (page-1)*per_page))
+
+    total_users = db.fetchone('SELECT COUNT(*) as count FROM users')['count']
+
+    if not users:
+        await update.message.reply_text("Пользователей не найдено")
+        return
+
+    text = f"👥 **Пользователи** (страница {page}/{max(1, (total_users + per_page - 1) // per_page)})\n\n"
+    buttons = []
+
+    for u in users:
+        status = "🔒" if u['is_banned'] else "✅"
+        vip = "👑" if u['vip_until'] and datetime.fromisoformat(u['vip_until']) > datetime.utcnow() else ""
+        text += f"{status} {vip} **{u['first_name'] or 'Нет имени'}** (@{u['username'] or 'нет'})\n"
+        text += f"   ID: `{u['tg_id']}` | Баланс: {u['balance']}₽\n"
+        text += f"   Зарегистрирован: {u['registered_at'][:10]}\n"
+        text += f"   Последняя активность: {u['last_active'][:10]}\n\n"
+
+        buttons.append([
+            InlineKeyboardButton('📊 Профиль', callback_data=f"user_profile:{u['id']}"),
+            InlineKeyboardButton('📦 Заказы', callback_data=f"user_orders:{u['id']}"),
+            InlineKeyboardButton('⚙️ Действия', callback_data=f"user_actions:{u['id']}")
+        ])
+
+    # Пагинация
+    pagination_buttons = []
+    if page > 1:
+        pagination_buttons.append(InlineKeyboardButton('⬅️ Назад', callback_data=f"users_page:{page-1}"))
+    if page * per_page < total_users:
+        pagination_buttons.append(InlineKeyboardButton('Вперед ➡️', callback_data=f"users_page:{page+1}"))
+
+    if pagination_buttons:
+        buttons.append(pagination_buttons)
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def user_profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = int(query.data.split(':')[1])
+
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+    if not user:
+        await query.answer("Пользователь не найден", show_alert=True)
+        return
+
+    orders_count = db.fetchone('SELECT COUNT(*) as count FROM orders WHERE user_id=?', (user_id,))['count']
+    completed_orders = db.fetchone('SELECT COUNT(*) as count FROM orders WHERE user_id=? AND status="completed"', (user_id,))['count']
+    total_spent = db.fetchone('SELECT SUM(total) as total FROM orders WHERE user_id=? AND status="completed"', (user_id,))['total'] or 0
+
+    referrals_count = db.fetchone('SELECT COUNT(*) as count FROM users WHERE invited_by=?', (user_id,))['count']
+
+    text = f"""
+👤 **Профиль пользователя**
+
+🆔 ID: `{user['tg_id']}`
+📝 Имя: {user['first_name']} {user['last_name'] or ''}
+📛 Username: @{user['username'] or 'нет'}
+🎮 PUBG ID: {user['pubg_id'] or 'Не указан'}
+📞 Телефон: {user['phone'] or 'Не указан'}
+
+📅 В сервисе с: {user['registered_at'][:10]}
+🔄 Последняя активность: {user['last_active'][:10]}
+
+💰 **Финансы:**
+Баланс: {user['balance']}₽
+Потрачено: {total_spent}₽
+Заказов: {orders_count} ({completed_orders} завершено)
+
+👥 **Рефералы:**
+Приглашено: {referrals_count}
+Заработано: {total_spent * REFERRAL_PERCENT:.2f}₽
+
+🔒 Статус: {'Забанен' if user['is_banned'] else 'Активен'}
+👑 VIP: {'Да' if user['vip_until'] and datetime.fromisoformat(user['vip_until']) > datetime.utcnow() else 'Нет'}
+"""
+
+    buttons = [
+        [InlineKeyboardButton('📦 Заказы пользователя', callback_data=f"user_orders:{user_id}")],
+        [InlineKeyboardButton('⚙️ Действия', callback_data=f"user_actions:{user_id}")],
+        [InlineKeyboardButton('⬅️ Назад', callback_data='admin_users')]
+    ]
+
+    await query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def user_orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = int(query.data.split(':')[1])
+
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+    if not user:
+        await query.answer("Пользователь не найден", show_alert=True)
+        return
+
+    orders = db.fetchall('SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 5', (user_id,))
+
+    if not orders:
+        await query.message.edit_text(f"У пользователя @{user['username'] or user['first_name']} пока нет заказов")
+        return
+
+    status_emoji = {
+        'awaiting_payment': '⏳',
+        'pending': '🔄',
+        'paid': '✅',
+        'in_progress': '🔨',
+        'delivering': '📦',
+        'completed': '✅',
+        'cancelled': '❌'
+    }
+
+    text = f"📦 **Заказы пользователя @{user['username'] or user['first_name']}**\n\n"
+    buttons = []
+
+    for order in orders:
+        emoji = status_emoji.get(order['status'], '❓')
+        items = json.loads(order['items'])
+        items_text = ', '.join([i['name'] for i in items[:2]])
+        if len(items) > 2:
+            items_text += f" +{len(items)-2}"
+
+        text += f"{emoji} **#{order['order_number']}** ({order['status']})\n"
+        text += f"   {order['total']}₽ | {order['created_at'][:10]}\n"
+        text += f"   {items_text}\n\n"
+
+        buttons.append([InlineKeyboardButton(f"#{order['order_number']}", callback_data=f"order_detail:{order['id']}")])
+
+    buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data=f"user_profile:{user_id}")])
+
+    await query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def user_actions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = int(query.data.split(':')[1])
+
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+    if not user:
+        await query.answer("Пользователь не найден", show_alert=True)
+        return
+
+    text = f"⚙️ **Действия для пользователя @{user['username'] or user['first_name']}**\n\nВыберите действие:"
+
+    buttons = [
+        [InlineKeyboardButton('💰 Пополнить баланс', callback_data=f"add_balance:{user_id}")],
+        [InlineKeyboardButton('💸 Вывести средства', callback_data=f"withdraw_balance:{user_id}")],
+        [InlineKeyboardButton('👑 Выдать VIP', callback_data=f"grant_vip:{user_id}")],
+        [InlineKeyboardButton('🔒 Забанить', callback_data=f"ban_user:{user_id}")],
+        [InlineKeyboardButton('📞 Связаться', url=f"tg://user?id={user['tg_id']}")],
+        [InlineKeyboardButton('⬅️ Назад', callback_data=f"user_profile:{user_id}")]
+    ]
+
+    if user['is_banned']:
+        buttons.insert(3, [InlineKeyboardButton('🔓 Разбанить', callback_data=f"unban_user:{user_id}")])
+
+    await query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def add_balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = int(query.data.split(':')[1])
+
+    context.user_data['adding_balance'] = user_id
+
+    await query.message.edit_text(
+        "Введите сумму для пополнения баланса пользователя:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_add_balance')]])
+    )
+
+async def add_balance_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if 'adding_balance' not in context.user_data:
+        return
+
+    try:
+        amount = float(update.message.text)
+        if amount <= 0:
+            raise ValueError
+
+        user_id = context.user_data['adding_balance']
+        user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+
+        db.execute('UPDATE users SET balance = balance + ? WHERE id=?', (amount, user_id))
+
+        # Логируем транзакцию
+        db.execute('''
+            INSERT INTO analytics (event_type, user_id, data, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', ('balance_add', user_id, json.dumps({'amount': amount, 'admin_id': update.effective_user.id}), now_iso()))
+
+        context.user_data.pop('adding_balance', None)
+
+        await update.message.reply_text(
+            f"✅ Баланс пользователя @{user['username'] or user['first_name']} пополнен на {amount}₽\n"
+            f"Новый баланс: {user['balance'] + amount}₽",
+            reply_markup=get_admin_keyboard()
+        )
+
+        try:
+            await context.bot.send_message(
+                user['tg_id'],
+                f"💰 Ваш баланс пополнен на {amount}₽!\nНовый баланс: {user['balance'] + amount}₽"
+            )
+        except:
+            pass
+
+    except ValueError:
+        await update.message.reply_text("Некорректная сумма. Введите положительное число.")
+
+async def withdraw_balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = int(query.data.split(':')[1])
+
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+    if not user:
+        await query.answer("Пользователь не найден", show_alert=True)
+        return
+
+    if user['balance'] <= 0:
+        await query.answer("У пользователя нет средств для вывода", show_alert=True)
+        return
+
+    context.user_data['withdrawing_balance'] = user_id
+
+    await query.message.edit_text(
+        f"Текущий баланс пользователя: {user['balance']}₽\n\nВведите сумму для вывода:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_withdraw_balance')]])
+    )
+
+async def withdraw_balance_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if 'withdrawing_balance' not in context.user_data:
+        return
+
+    try:
+        amount = float(update.message.text)
+        if amount <= 0:
+            raise ValueError
+
+        user_id = context.user_data['withdrawing_balance']
+        user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+
+        if user['balance'] < amount:
+            await update.message.reply_text("У пользователя недостаточно средств")
+            return
+
+        db.execute('UPDATE users SET balance = balance - ? WHERE id=?', (amount, user_id))
+
+        # Логируем транзакцию
+        db.execute('''
+            INSERT INTO analytics (event_type, user_id, data, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', ('balance_withdraw', user_id, json.dumps({'amount': amount, 'admin_id': update.effective_user.id}), now_iso()))
+
+        context.user_data.pop('withdrawing_balance', None)
+
+        await update.message.reply_text(
+            f"✅ С баланса пользователя @{user['username'] or user['first_name']} списано {amount}₽\n"
+            f"Новый баланс: {user['balance'] - amount}₽",
+            reply_markup=get_admin_keyboard()
+        )
+
+        try:
+            await context.bot.send_message(
+                user['tg_id'],
+                f"💸 С вашего баланса списано {amount}₽\nНовый баланс: {user['balance'] - amount}₽"
+            )
+        except:
+            pass
+
+    except ValueError:
+        await update.message.reply_text("Некорректная сумма. Введите положительное число.")
+
+async def grant_vip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = int(query.data.split(':')[1])
+
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+    if not user:
+        await query.answer("Пользователь не найден", show_alert=True)
+        return
+
+    context.user_data['granting_vip'] = user_id
+
+    buttons = [
+        [InlineKeyboardButton('1 день', callback_data='vip_duration:1')],
+        [InlineKeyboardButton('7 дней', callback_data='vip_duration:7')],
+        [InlineKeyboardButton('30 дней', callback_data='vip_duration:30')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_grant_vip')]
+    ]
+
+    await query.message.edit_text(
+        "Выберите продолжительность VIP-статуса:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def vip_duration_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    days = int(query.data.split(':')[1])
+
+    user_id = context.user_data['granting_vip']
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+
+    vip_until = datetime.utcnow() + timedelta(days=days)
+    db.execute('UPDATE users SET vip_until=? WHERE id=?', (vip_until.isoformat(), user_id))
+
+    context.user_data.pop('granting_vip', None)
+
+    await query.message.edit_text(
+        f"✅ Пользователю @{user['username'] or user['first_name']} выдан VIP-статус до {vip_until.strftime('%d.%m.%Y')}",
+        reply_markup=get_admin_keyboard()
+    )
+
+    try:
+        await context.bot.send_message(
+            user['tg_id'],
+            f"👑 Вам выдан VIP-статус до {vip_until.strftime('%d.%m.%Y')}!\n"
+            "Теперь вы можете пользоваться эксклюзивными преимуществами."
+        )
+    except:
+        pass
+
+async def ban_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = int(query.data.split(':')[1])
+
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+    if not user:
+        await query.answer("Пользователь не найден", show_alert=True)
+        return
+
+    db.execute('UPDATE users SET is_banned=1 WHERE id=?', (user_id,))
+
+    await query.message.edit_text(
+        f"✅ Пользователь @{user['username'] or user['first_name']} забанен",
+        reply_markup=get_admin_keyboard()
+    )
+
+    try:
+        await context.bot.send_message(
+            user['tg_id'],
+            "⚠️ Ваш аккаунт заблокирован. Обратитесь в поддержку для разблокировки."
+        )
+    except:
+        pass
+
+async def unban_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = int(query.data.split(':')[1])
+
+    user = db.fetchone('SELECT * FROM users WHERE id=?', (user_id,))
+    if not user:
+        await query.answer("Пользователь не найден", show_alert=True)
+        return
+
+    db.execute('UPDATE users SET is_banned=0 WHERE id=?', (user_id,))
+
+    await query.message.edit_text(
+        f"✅ Пользователь @{user['username'] or user['first_name']} разбанен",
+        reply_markup=get_admin_keyboard()
+    )
+
+    try:
+        await context.bot.send_message(
+            user['tg_id'],
+            "🎉 Ваш аккаунт разблокирован! Вы снова можете пользоваться сервисом."
+        )
+    except:
+        pass
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    context.user_data['broadcasting'] = True
+
+    buttons = [
+        [InlineKeyboardButton('✅ С фото', callback_data='broadcast_with_photo')],
+        [InlineKeyboardButton('📝 Только текст', callback_data='broadcast_text_only')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_broadcast')]
+    ]
+
+    await update.message.reply_text(
+        "📢 **Рассылка сообщений**\n\nВыберите тип рассылки:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def broadcast_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    broadcast_type = query.data.split('_')[1]
+
+    context.user_data['broadcast_type'] = broadcast_type
+
+    if broadcast_type == 'with_photo':
+        await query.message.edit_text(
+            "Отправьте фото для рассылки (или нажмите 'Пропустить'):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('📎 Пропустить', callback_data='skip_broadcast_photo')],
+                [InlineKeyboardButton('❌ Отмена', callback_data='cancel_broadcast')]
+            ])
+        )
+    else:
+        await query.message.edit_text(
+            "Введите текст сообщения для рассылки:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_broadcast')]])
+        )
+
+async def broadcast_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('broadcasting'):
+        return
+
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        context.user_data['broadcast_photo'] = file_id
+
+    await update.message.reply_text(
+        "Введите текст сообщения для рассылки:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Отмена', callback_data='cancel_broadcast')]])
+    )
+
+async def broadcast_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get('broadcasting'):
+        return
+
+    context.user_data['broadcast_text'] = update.message.text
+
+    await confirm_broadcast(update, context)
+
+async def confirm_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.user_data
+    broadcast_type = data.get('broadcast_type', 'text_only')
+
+    text = f"""
+📢 **Подтверждение рассылки**
+
+Тип: {'С фото' if broadcast_type == 'with_photo' else 'Только текст'}
+Текст: {data['broadcast_text']}
+Фото: {'Есть' if data.get('broadcast_photo') else 'Нет'}
+
+⚠️ Сообщение будет отправлено ВСЕМ пользователям!
+"""
+
+    buttons = [
+        [InlineKeyboardButton('✅ Отправить', callback_data='confirm_send_broadcast')],
+        [InlineKeyboardButton('❌ Отмена', callback_data='cancel_broadcast')]
+    ]
+
+    if isinstance(update, Update) and update.callback_query:
+        await update.callback_query.message.edit_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+    else:
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def confirm_send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = context.user_data
+    broadcast_type = data.get('broadcast_type', 'text_only')
+    text = data['broadcast_text']
+    photo = data.get('broadcast_photo')
+
+    users = db.fetchall('SELECT tg_id FROM users')
+    total_users = len(users)
+    success_count = 0
+
+    await query.message.edit_text(f"📢 Начинаем рассылку для {total_users} пользователей...")
+
+    for user in users:
+        try:
+            if broadcast_type == 'with_photo' and photo:
+                await context.bot.send_photo(user['tg_id'], photo, caption=text, parse_mode='Markdown')
+            else:
+                await context.bot.send_message(user['tg_id'], text, parse_mode='Markdown')
+            success_count += 1
+        except Exception as e:
+            logger.error(f"Failed to send broadcast to {user['tg_id']}: {e}")
+
+    context.user_data.pop('broadcasting', None)
+    context.user_data.pop('broadcast_type', None)
+    context.user_data.pop('broadcast_text', None)
+    context.user_data.pop('broadcast_photo', None)
+
+    await query.message.edit_text(
+        f"✅ Рассылка завершена!\n\n"
+        f"Отправлено: {success_count}/{total_users} пользователям"
+    )
+
+async def admin_payouts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    payouts = db.fetchall('''
+        SELECT wp.*, u.username, u.first_name, o.order_number
+        FROM worker_payouts wp
+        LEFT JOIN users u ON wp.worker_id = u.id
+        LEFT JOIN orders o ON wp.order_id = o.id
+        ORDER BY wp.created_at DESC
+        LIMIT 20
+    ''')
+
+    if not payouts:
+        await update.message.reply_text("Выплат не найдено")
+        return
+
+    text = "💰 **Выплаты исполнителям**\n\n"
+    buttons = []
+
+    for payout in payouts:
+        status = "✅" if payout['status'] == 'paid' else "⏳" if payout['status'] == 'pending' else "❌"
+        worker_name = payout['first_name'] or payout['username'] or 'Неизвестно'
+        text += f"{status} **{worker_name}**\n"
+        text += f"   Сумма: {payout['amount']}₽ | Заказ: #{payout['order_number'] or 'Нет'}\n"
+        text += f"   Статус: {payout['status']} | {payout['created_at'][:10]}\n\n"
+
+        if payout['status'] == 'pending':
+            buttons.append([
+                InlineKeyboardButton('✅ Выплачено', callback_data=f"mark_paid:{payout['id']}"),
+                InlineKeyboardButton('❌ Отклонить', callback_data=f"reject_payout:{payout['id']}")
+            ])
+
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+async def mark_payout_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    payout_id = int(query.data.split(':')[1])
+
+    payout = db.fetchone('SELECT * FROM worker_payouts WHERE id=?', (payout_id,))
+    if not payout:
+        await query.answer("Выплата не найдена", show_alert=True)
+        return
+
+    db.execute('UPDATE worker_payouts SET status=?, paid_at=? WHERE id=?', ('paid', now_iso(), payout_id))
+
+    worker = db.fetchone('SELECT * FROM users WHERE id=?', (payout['worker_id'],))
+    if worker:
+        try:
+            await context.bot.send_message(
+                worker['tg_id'],
+                f"💰 Вам выплачено {payout['amount']}₽ за выполнение заказа!"
+            )
+        except:
+            pass
+
+    await query.message.edit_text(f"✅ Выплата #{payout_id} отмечена как выплаченная")
+
+async def reject_payout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    payout_id = int(query.data.split(':')[1])
+
+    payout = db.fetchone('SELECT * FROM worker_payouts WHERE id=?', (payout_id,))
+    if not payout:
+        await query.answer("Выплата не найдена", show_alert=True)
+        return
+
+    db.execute('UPDATE worker_payouts SET status=? WHERE id=?', ('rejected', payout_id))
+
+    await query.message.edit_text(f"❌ Выплата #{payout_id} отклонена")
+
+# ============== UPDATE BOT APP WITH ADMIN HANDLERS ==============
+
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+        
+    text = update.message.text.strip()
+    user = update.effective_user
+    
+    if text == '🛍 Каталог' or text.startswith('🛍'):
+        await catalog_handler(update, context)
+    elif text == '🛒 Корзина':
+        await cart_handler(update, context)
+    elif text == '👤 Профиль':
+        await profile_handler(update, context)
+    elif text == '📦 Мои заказы':
+        await my_orders_handler(update, context)
+    elif text == '💝 Избранное':
+        await favorites_handler(update, context)
+    elif text == '🎮 PUBG ID':
+        context.user_data['awaiting_pubg'] = True
+        await update.message.reply_text(
+            "🎮 Введите ваш PUBG ID:",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton('⬅️ Отмена')]], resize_keyboard=True)
+        )
+    elif text == '📞 Поддержка':
+        await update.message.reply_text(f"📞 **Поддержка**\n\nНаписать: {SUPPORT_CONTACT_USER}", parse_mode='Markdown')
+    elif text == '📄 Документы':
+        await update.message.reply_text(
+            "📄 **Документы**",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('📜 Пользовательское соглашение', callback_data='doc_terms')],
+                [InlineKeyboardButton('🔒 Политика конфиденциальности', callback_data='doc_privacy')]
+            ])
+        )
+    elif text == '⚙️ Админ-панель' and is_admin(user.id):
+        await update.message.reply_text("⚙️ Админ-панель:", reply_markup=get_admin_keyboard())
+    elif text == '⬅️ Главное меню' or text == '⬅️ Отмена':
+        context.user_data.clear()
+        await update.message.reply_text("Главное меню:", reply_markup=get_main_menu(user.id))
+    elif context.user_data.get('awaiting_pubg'):
+        db.execute('UPDATE users SET pubg_id=? WHERE tg_id=?', (text, user.id))
+        context.user_data.pop('awaiting_pubg')
+        await update.message.reply_text(f"✅ PUBG ID сохранен: `{text}`", parse_mode='Markdown', reply_markup=get_main_menu(user.id))
+    else:
+        await update.message.reply_text("Используйте меню для навигации", reply_markup=get_main_menu(user.id))
+
+        
+        
+
 def build_bot_app():
     app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
+    # Основные хендлеры
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CallbackQueryHandler(category_callback, pattern=r'^cat:'))
+    app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^product:'))
+    app.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern=r'^add_cart:'))
+    app.add_handler(CallbackQueryHandler(toggle_favorite_callback, pattern=r'^toggle_fav:'))
+    app.add_handler(CallbackQueryHandler(checkout_callback, pattern=r'^checkout'))
+    app.add_handler(CallbackQueryHandler(admin_order_action, pattern=r'^admin_'))
+    app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^leave_review:'))
 
-    app.add_handler(CallbackQueryHandler(category_callback, pattern=r"^cat:"))
-    app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r"^product:"))
-    app.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern=r"^add_cart:"))
-    app.add_handler(CallbackQueryHandler(checkout_callback, pattern=r"^checkout$"))
-
-    app.add_handler(CallbackQueryHandler(cart_update_callback, pattern=r"^cart_(minus|plus|remove):"))
-    app.add_handler(CallbackQueryHandler(cart_update_callback, pattern=r"^cart_clear$"))
-    app.add_handler(CallbackQueryHandler(cart_update_callback, pattern=r"^noop$"))
-
-    # Покрывает текстовые кнопки меню / сообщения и фото оплаты
+    # Админ хендлеры
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
 
+    # Админ-панель
+    app.add_handler(CommandHandler('admin', admin_panel))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^⚙️ Админ-панель$'), admin_panel))
+
+    # Статистика
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^📊 Статистика$'), admin_stats))
+    app.add_handler(CallbackQueryHandler(admin_stats, pattern=r'^refresh_stats$'))
+    app.add_handler(CallbackQueryHandler(admin_stats, pattern=r'^detailed_stats$'))
+
+    # Заказы
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^📦 Все заказы$'), admin_orders))
+    app.add_handler(CallbackQueryHandler(admin_orders, pattern=r'^orders_page:'))
+    app.add_handler(CallbackQueryHandler(admin_orders, pattern=r'^orders_filter:'))
+
+    # Товары
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^➕ Добавить товар$'), admin_products))
+    app.add_handler(CallbackQueryHandler(admin_products, pattern=r'^products_page:'))
+    app.add_handler(CallbackQueryHandler(add_product_handler, pattern=r'^add_product$'))
+    app.add_handler(CallbackQueryHandler(set_product_category, pattern=r'^set_category:'))
+    app.add_handler(CallbackQueryHandler(confirm_product_creation, pattern=r'^confirm_add_product$'))
+    app.add_handler(CallbackQueryHandler(cancel_add_product, pattern=r'^cancel_add_product$'))
+    app.add_handler(CallbackQueryHandler(edit_product_handler, pattern=r'^edit_product:'))
+    app.add_handler(CallbackQueryHandler(edit_set_category, pattern=r'^edit_set_category:'))
+    app.add_handler(CallbackQueryHandler(save_product_handler, pattern=r'^save_product$'))
+    app.add_handler(CallbackQueryHandler(delete_product_handler, pattern=r'^delete_product:'))
+    app.add_handler(CallbackQueryHandler(confirm_delete_product, pattern=r'^confirm_delete:'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, product_name_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, product_price_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, product_old_price_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, product_short_desc_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, product_desc_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, product_photo_handler))
+    app.add_handler(CallbackQueryHandler(skip_photo_handler, pattern=r'^skip_photo$'))
+    app.add_handler(CallbackQueryHandler(edit_product_field, pattern=r'^edit_'))
+    app.add_handler(CallbackQueryHandler(cancel_edit_product, pattern=r'^cancel_edit_product$'))
+
+    # Категории
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^📁 Категории$'), admin_categories))
+    app.add_handler(CallbackQueryHandler(add_category_handler, pattern=r'^add_category$'))
+    app.add_handler(CallbackQueryHandler(confirm_add_category, pattern=r'^confirm_add_category$'))
+    app.add_handler(CallbackQueryHandler(cancel_add_category, pattern=r'^cancel_add_category$'))
+    app.add_handler(CallbackQueryHandler(edit_category_handler, pattern=r'^edit_category:'))
+    app.add_handler(CallbackQueryHandler(edit_category_field, pattern=r'^edit_cat_'))
+    app.add_handler(CallbackQueryHandler(save_category_handler, pattern=r'^save_category$'))
+    app.add_handler(CallbackQueryHandler(delete_category_handler, pattern=r'^delete_category:'))
+    app.add_handler(CallbackQueryHandler(confirm_delete_category, pattern=r'^confirm_delete_category:'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, category_name_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, category_emoji_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, category_desc_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, category_sort_order_handler))
+
+    # Промокоды
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^🏷 Промокоды$'), admin_promocodes))
+    app.add_handler(CallbackQueryHandler(add_promocode_handler, pattern=r'^add_promocode$'))
+    app.add_handler(CallbackQueryHandler(promocode_type_handler, pattern=r'^promo_type:'))
+    app.add_handler(CallbackQueryHandler(confirm_add_promocode, pattern=r'^confirm_add_promocode$'))
+    app.add_handler(CallbackQueryHandler(cancel_add_promocode, pattern=r'^cancel_add_promocode$'))
+    app.add_handler(CallbackQueryHandler(edit_promocode_handler, pattern=r'^edit_promocode:'))
+    app.add_handler(CallbackQueryHandler(edit_promocode_field, pattern=r'^edit_promo_'))
+    app.add_handler(CallbackQueryHandler(set_promo_type, pattern=r'^set_promo_type:'))
+    app.add_handler(CallbackQueryHandler(save_promocode_handler, pattern=r'^save_promocode$'))
+    app.add_handler(CallbackQueryHandler(delete_promocode_handler, pattern=r'^delete_promocode:'))
+        app.add_handler(CallbackQueryHandler(confirm_delete_promocode, pattern=r'^confirm_delete_promocode:'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_code_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_value_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_min_order_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_max_discount_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_uses_total_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, promocode_uses_per_user_handler))
+
+    # Пользователи
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^👥 Пользователи$'), admin_users))
+    app.add_handler(CallbackQueryHandler(admin_users, pattern=r'^users_page:'))
+    app.add_handler(CallbackQueryHandler(user_profile_handler, pattern=r'^user_profile:'))
+    app.add_handler(CallbackQueryHandler(user_orders_handler, pattern=r'^user_orders:'))
+    app.add_handler(CallbackQueryHandler(user_actions_handler, pattern=r'^user_actions:'))
+    app.add_handler(CallbackQueryHandler(add_balance_handler, pattern=r'^add_balance:'))
+    app.add_handler(CallbackQueryHandler(withdraw_balance_handler, pattern=r'^withdraw_balance:'))
+    app.add_handler(CallbackQueryHandler(grant_vip_handler, pattern=r'^grant_vip:'))
+    app.add_handler(CallbackQueryHandler(ban_user_handler, pattern=r'^ban_user:'))
+    app.add_handler(CallbackQueryHandler(unban_user_handler, pattern=r'^unban_user:'))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_balance_amount_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_balance_amount_handler))
+    app.add_handler(CallbackQueryHandler(vip_duration_handler, pattern=r'^vip_duration:'))
+    app.add_handler(CallbackQueryHandler(cancel_add_balance, pattern=r'^cancel_add_balance$'))
+    app.add_handler(CallbackQueryHandler(cancel_withdraw_balance, pattern=r'^cancel_withdraw_balance$'))
+    app.add_handler(CallbackQueryHandler(cancel_grant_vip, pattern=r'^cancel_grant_vip$'))
+
+    # Рассылка
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^📢 Рассылка$'), admin_broadcast))
+    app.add_handler(CallbackQueryHandler(broadcast_type_handler, pattern=r'^broadcast_'))
+    app.add_handler(MessageHandler(filters.PHOTO, broadcast_photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_text_handler))
+    app.add_handler(CallbackQueryHandler(confirm_send_broadcast, pattern=r'^confirm_send_broadcast$'))
+    app.add_handler(CallbackQueryHandler(cancel_broadcast, pattern=r'^cancel_broadcast$'))
+    app.add_handler(CallbackQueryHandler(skip_broadcast_photo, pattern=r'^skip_broadcast_photo$'))
+
+    # Выплаты
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex('^💰 Выплаты$'), admin_payouts))
+    app.add_handler(CallbackQueryHandler(mark_payout_paid, pattern=r'^mark_paid:'))
+    app.add_handler(CallbackQueryHandler(reject_payout, pattern=r'^reject_payout:'))
+
+    # Отмена действий
+    app.add_handler(CallbackQueryHandler(cancel_action, pattern=r'^cancel_'))
+    
     return app
 
-
-# === ЗАПУСК ВЕБ-СЕРВЕРА И БОТА ===
+# ============== MAIN ==============
 def run_webapp():
     import uvicorn
     uvicorn.run(webapp, host=WEBAPP_HOST, port=WEBAPP_PORT, log_level="info")
 
 def run_bot():
     application = build_bot_app()
-    logger.info("🤖 Bot polling started...")
     application.run_polling()
 
-
-# === ТОЧКА ВХОДА — ТОЛЬКО ОТКРЫТЬ ФАЙЛ И ЗАПУСТИТЬ ===
 if __name__ == "__main__":
-    print("🚀 Запуск Metro Shop: Telegram Bot + WebApp")
+    print("🚀 Starting Metro Shop Bot + WebApp Server...")
     print(f"📱 WebApp URL: {WEBAPP_URL}")
-    print(f"🌐 Web Server: http://{WEBAPP_HOST}:{WEBAPP_PORT}")
-
-    # Запускаем WebApp сервер в фоне
-    web_thread = threading.Thread(target=run_webapp, daemon=True)
-    web_thread.start()
-
-    # Запускаем бота в основном потоке
+    print(f"🌐 Server: http://{WEBAPP_HOST}:{WEBAPP_PORT}")
+    
+    # Start webapp in separate thread
+    webapp_thread = threading.Thread(target=run_webapp, daemon=True)
+    webapp_thread.start()
+    
+    # Run bot in main thread
     run_bot()
